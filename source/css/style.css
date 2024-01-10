@@ -4,11 +4,11 @@ body {
   font-family: "Open Sans", sans-serif;
   text-align: center;
   margin: 0 auto;
-  max-width: 1170px;
 }
 
 header .header_topbar {
   border: 1px solid #EEEEEE;
+  padding: 0 20% 0 20%;
 }
 header .header_topbar_ul {
   display: -webkit-box;
@@ -25,6 +25,7 @@ header .header_topbar_ul li:hover {
   background-color: #EEEEEE;
 }
 header .header_info {
+  padding: 0 15% 0 15%;
   display: -webkit-box;
   display: -ms-flexbox;
   display: flex;
@@ -54,6 +55,7 @@ header .header_info button:hover {
   color: white;
 }
 header nav {
+  padding: 0 15% 0 15%;
   background-color: #336699;
 }
 header nav .header_menu {
@@ -74,22 +76,175 @@ header nav .header_menu a:hover {
   background-color: #3973AC;
 }
 
-.contentContainer_banner {
+.contentContainer {
+  -webkit-box-align: center;
+      -ms-flex-align: center;
+          align-items: center;
+}
+.contentContainer .contentContainer_banner {
   width: 100%;
   height: 500px;
   background-image: url("/img/сантехниккрасноярск.jpg");
+  background-position: bottom;
+  -webkit-box-align: center;
+      -ms-flex-align: center;
+          align-items: center;
+  padding: 7%;
 }
-.contentContainer_banner h1 {
-  color: white;
-  font-size: 20px;
-  position: absolute;
+.contentContainer .contentContainer_box {
+  background-color: rgba(0, 0, 0, 0.6);
+  width: 70%;
   margin: 0 auto;
+  padding: 20px;
+}
+.contentContainer h1, .contentContainer p, .contentContainer button {
+  color: rgb(255, 255, 255);
+  font-size: 35px;
+  padding: 30px;
+}
+.contentContainer p {
+  font-size: 20px;
+}
+.contentContainer button {
+  font-size: 13px;
+  border-radius: 5px;
+  padding: 10px;
+  background-color: #336699;
+  margin: 30px;
+}
+.contentContainer button:hover {
+  background-color: #444444;
 }
 
-.contentContainer_banner_gradient {
-  background-image: -webkit-gradient(linear, left top, left bottom, from(black), to(white));
-  background-image: linear-gradient(black, white);
-  width: 100%;
-  height: 100%;
+.advantage_container {
+  padding: 0 15% 0 15%;
+  display: -webkit-box;
+  display: -ms-flexbox;
+  display: flex;
+  -ms-flex-pack: distribute;
+      justify-content: space-around;
+  margin-top: 50px;
+  color: #34A4E3;
+  font-weight: bold;
+  -ms-flex-wrap: wrap;
+      flex-wrap: wrap;
+}
+.advantage_container div {
+  max-width: 250px;
+  margin: 20px;
+}
+.advantage_container p {
+  padding: 15px;
+}
+.advantage_container span {
+  color: #666666;
+  font-weight: 500;
+}
+
+.text {
+  padding: 5% 15% 0 15%;
+  font-size: 14px;
+  line-height: 25px;
+  text-align: justify;
+}
+.text .items {
+  width: 80%;
+  line-height: 30px;
+}
+.text span {
+  font-weight: bold;
+}
+
+.popular_services {
+  padding: 5% 15% 0 15%;
+}
+
+h2 {
+  font-size: 30px;
+  font-weight: 600;
+}
+
+.popular_services_items {
+  position: relative;
+  padding: 10px;
+  display: -webkit-box;
+  display: -ms-flexbox;
+  display: flex;
+  -ms-flex-wrap: wrap;
+      flex-wrap: wrap;
+  font-size: 22px;
+}
+.popular_services_items div {
+  text-align: left;
+  display: -webkit-box;
+  display: -ms-flexbox;
+  display: flex;
+  -webkit-box-align: end;
+      -ms-flex-align: end;
+          align-items: end;
+  padding: 10px;
+  -webkit-box-flex: 20%;
+      -ms-flex: 20%;
+          flex: 20%;
+  margin: 30px;
+  -webkit-box-pack: center;
+      -ms-flex-pack: center;
+          justify-content: center;
+  height: 250px;
+  -ms-flex-wrap: wrap;
+      flex-wrap: wrap;
+  color: white;
+}
+.popular_services_items .blueblock {
+  margin: 0;
+  position: absolute;
+  top: 70%;
+  left: 0;
+  bottom: 0;
+  right: 0;
+  background-color: blue;
   opacity: 0.5;
+  overflow: hidden;
+}
+.popular_services_items .item1 {
+  background-image: url("/img/разводка труб.jpg");
+  background-size: cover;
+  background-repeat: no-repeat;
+  position: relative;
+  overflow: hidden;
+}
+.popular_services_items .item2 {
+  background-image: url("/img/сантехмонтаж.jpg");
+  background-size: cover;
+  background-repeat: no-repeat;
+  position: relative;
+  overflow: hidden;
+}
+.popular_services_items .item3 {
+  background-image: url("/img/ремонтсанузла.jpeg");
+  background-size: cover;
+  background-repeat: no-repeat;
+  position: relative;
+  overflow: hidden;
+}
+.popular_services_items .item4 {
+  background-image: url("/img/батарея замена.jpg");
+  background-size: cover;
+  background-repeat: no-repeat;
+  position: relative;
+  overflow: hidden;
+}
+.popular_services_items .item5 {
+  background-image: url("/img/Монтаж-водянного-теплого-пола-2.jpg");
+  background-size: cover;
+  background-repeat: no-repeat;
+  position: relative;
+  overflow: hidden;
+}
+.popular_services_items .item6 {
+  background-image: url("/img/монтаж котла отопления.jpg");
+  background-size: cover;
+  background-repeat: no-repeat;
+  position: relative;
+  overflow: hidden;
 }
