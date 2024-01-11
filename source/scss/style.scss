@@ -146,7 +146,7 @@ header{
     }
     .popular_services_items{
         position: relative;
-        padding: 10px;
+        padding-top: 50px;
         display: flex;
         flex-wrap: wrap;
         font-size: 22px;
@@ -154,23 +154,33 @@ header{
             text-align: left;
             display: flex;
             align-items: end;
-            padding: 10px;
+            padding: 20px;
             flex:20%;
             margin: 30px;
-            justify-content: center;
+            justify-content: left;
             height: 250px;
             flex-wrap: wrap;
             color: white;
+            &:hover{
+                .blueblock{
+                    top: 0;
+                }
+                cursor: pointer;
+            }
+        }
+        h3{
+            z-index: 2;
+            font-weight: 600;
         }
         .blueblock{
             margin: 0;
             position: absolute;
-            top: 70%;
+            top: 60%;
             left: 0;
             bottom: 0;
             right: 0;
-            background-color: blue;
-            opacity: 0.5;
+            background-color: #336699;
+            opacity: 0.6;
             overflow: hidden;
         }
         .item1{

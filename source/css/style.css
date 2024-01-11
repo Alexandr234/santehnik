@@ -166,7 +166,7 @@ h2 {
 
 .popular_services_items {
   position: relative;
-  padding: 10px;
+  padding-top: 50px;
   display: -webkit-box;
   display: -ms-flexbox;
   display: flex;
@@ -182,28 +182,38 @@ h2 {
   -webkit-box-align: end;
       -ms-flex-align: end;
           align-items: end;
-  padding: 10px;
+  padding: 20px;
   -webkit-box-flex: 20%;
       -ms-flex: 20%;
           flex: 20%;
   margin: 30px;
-  -webkit-box-pack: center;
-      -ms-flex-pack: center;
-          justify-content: center;
+  -webkit-box-pack: left;
+      -ms-flex-pack: left;
+          justify-content: left;
   height: 250px;
   -ms-flex-wrap: wrap;
       flex-wrap: wrap;
   color: white;
 }
+.popular_services_items div:hover {
+  cursor: pointer;
+}
+.popular_services_items div:hover .blueblock {
+  top: 0;
+}
+.popular_services_items h3 {
+  z-index: 2;
+  font-weight: 600;
+}
 .popular_services_items .blueblock {
   margin: 0;
   position: absolute;
-  top: 70%;
+  top: 60%;
   left: 0;
   bottom: 0;
   right: 0;
-  background-color: blue;
-  opacity: 0.5;
+  background-color: #336699;
+  opacity: 0.6;
   overflow: hidden;
 }
 .popular_services_items .item1 {
