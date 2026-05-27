@@ -124,6 +124,99 @@ STYLE_PREFIX_SHORT = {
 }
 
 
+# Names of famous real people that image generators often refuse or distort.
+# scene_prompt is sanitized against this list before building the final prompt.
+FAMOUS_NAMES: set[str] = {
+    # English / international
+    "albert einstein", "einstein", "isaac newton", "newton", "charles darwin", "darwin",
+    "galileo galilei", "galileo", "nikola tesla", "tesla", "marie curie", "curie",
+    "stephen hawking", "hawking", "richard feynman", "feynman",
+    "julius caesar", "caesar", "napoleon", "napoleon bonaparte", "bonaparte",
+    "alexander the great", "genghis khan", "attila", "hannibal",
+    "cleopatra", "tutankhamun", "ramesses", "ramses",
+    "christopher columbus", "columbus", "marco polo", "magellan",
+    "leonardo da vinci", "da vinci", "michelangelo", "raphael", "botticelli",
+    "plato", "aristotle", "socrates", "pythagoras", "archimedes", "euclid",
+    "confucius", "buddha", "zoroaster",
+    "abraham lincoln", "lincoln", "george washington", "washington",
+    "thomas jefferson", "jefferson", "benjamin franklin", "franklin",
+    "winston churchill", "churchill", "franklin roosevelt", "roosevelt",
+    "adolf hitler", "hitler", "joseph stalin", "stalin", "mussolini",
+    "karl marx", "marx", "friedrich engels", "engels", "vladimir lenin", "lenin",
+    "mao zedong", "mao", "che guevara", "guevara", "fidel castro", "castro",
+    "nelson mandela", "mandela", "mahatma gandhi", "gandhi",
+    "martin luther king", "martin luther",
+    "william shakespeare", "shakespeare", "dante alighieri", "dante",
+    "homer", "virgil", "cervantes",
+    "sigmund freud", "freud", "carl jung", "jung",
+    "adam smith", "john maynard keynes", "keynes",
+    "elon musk", "musk", "steve jobs", "jeff bezos", "bezos",
+    "bill gates", "gates", "mark zuckerberg", "zuckerberg",
+    "donald trump", "trump", "joe biden", "biden",
+    "barack obama", "obama", "vladimir putin", "putin",
+    "angela merkel", "merkel", "emmanuel macron", "macron",
+    "queen elizabeth", "king charles", "princess diana", "diana",
+    # Russian historical figures (in transliteration — appear in EN prompts)
+    "ivan the terrible", "peter the great", "catherine the great",
+    "nicholas ii", "alexander ii", "alexander iii",
+    "yuri gagarin", "gagarin", "mikhail gorbachev", "gorbachev",
+    "boris yeltsin", "yeltsin", "nikita khrushchev", "khrushchev",
+    # Кириллица — для RU-промптов
+    "эйнштейн", "ньютон", "дарвин", "галилей", "тесла", "кюри",
+    "наполеон", "бонапарт", "цезарь", "александр македонский",
+    "чингисхан", "аттила", "ганнибал", "клеопатра",
+    "колумб", "магеллан", "леонардо да винчи", "да винчи",
+    "платон", "аристотель", "сократ", "пифагор", "архимед",
+    "маркс", "энгельс", "ленин", "сталин", "гитлер", "муссолини",
+    "пётр первый", "пётр i", "пётр великий",
+    "екатерина великая", "екатерина вторая",
+    "иван грозный", "николай второй", "александр второй",
+    "гагарин", "горбачёв", "горбачев", "ельцин", "хрущёв", "хрущев",
+    "путин", "трамп", "байден", "обама", "меркель", "макрон",
+    "шекспир", "данте", "гомер", "сервантес",
+    "фрейд", "юнг", "маркс", "ганди", "мандела",
+    "маск", "джобс", "гейтс", "цукерберг",
+}
+
+
+def sanitize_real_names(scene_prompt: str, language_code: str) -> str:
+    """Remove real people's names from scene_prompt, replacing with generic role descriptor."""
+    if not scene_prompt:
+        return scene_prompt
+
+    generic_ru = "исторический деятель"
+    generic_en = "historical figure"
+    replacement = generic_ru if language_code == "ru" else generic_en
+
+    # Check against known names list (longest first to avoid partial replacements)
+    t_low = scene_prompt.lower()
+    for name in sorted(FAMOUS_NAMES, key=len, reverse=True):
+        if name in t_low:
+            scene_prompt = re.sub(re.escape(name), replacement, scene_prompt, flags=re.IGNORECASE)
+            t_low = scene_prompt.lower()
+
+    # Catch remaining "Имя Фамилия" patterns (two consecutive Cyrillic capitalised words)
+    scene_prompt = re.sub(
+        r'\b[А-ЯЁ][а-яё]{2,}\s+[А-ЯЁ][а-яё]{2,}\b',
+        replacement,
+        scene_prompt,
+    )
+
+    # Catch remaining "Firstname Lastname" patterns (two consecutive Latin capitalised words)
+    # Guard: skip if it looks like a place name by checking the word after the pattern.
+    scene_prompt = re.sub(
+        r'\b([A-Z][a-z]{2,})\s+([A-Z][a-z]{2,})\b',
+        lambda m: replacement if (m.group(1).lower() + " " + m.group(2).lower()) not in {
+            "new york", "los angeles", "san francisco", "las vegas", "new orleans",
+            "north america", "south america", "middle east", "red square",
+            "black sea", "dead sea", "pacific ocean", "atlantic ocean",
+        } else m.group(0),
+        scene_prompt,
+    )
+
+    return clean_text(scene_prompt)
+
+
 # ── Dataclasses ─────────────────────────────────────────────────────────────
 
 @dataclass
@@ -714,6 +807,11 @@ PROMPT_SYSTEM_BY_LANG = {
 - Один главный объект, максимум 1-3 второстепенных
 - Не профессиональная иллюстрация, не vector art, не 3D, не cinematic
 
+ЗАПРЕТ НА ИМЕНА РЕАЛЬНЫХ ЛЮДЕЙ:
+- Никогда не упоминай имена реальных людей в scene_prompt: ни знаменитостей, ни политиков, ни учёных, ни исторических деятелей
+- Вместо имени используй роль: учёный, правитель, полководец, художник, философ, первооткрыватель и т.п.
+- Даже если в тексте озвучки звучит имя — в scene_prompt пиши только роль, не имя
+
 ЧЕТЫРЕ ТИПА КАДРОВ:
 1. scene — обычная сюжетная сцена (по умолчанию, ~80% кадров)
 2. big_text — только крупная цифра или слово на белом фоне (для статистики и процентов)
@@ -742,6 +840,11 @@ MANDATORY STYLE for every frame:
 - Flat pastel colors, minimal shading, lots of empty space
 - One main object, at most 1-3 supporting objects
 - Not professional illustration, not vector art, not 3D, not cinematic
+
+NO REAL PERSON NAMES:
+- Never mention real people's names in scene_prompt: no celebrities, politicians, scientists, or historical figures by name
+- Use a role descriptor instead: scientist, ruler, general, artist, philosopher, explorer, etc.
+- Even if the voiceover text says a name — write only the role in scene_prompt, never the name
 
 FOUR FRAME TYPES:
 1. scene — regular narrative scene (default, ~80% of frames)
@@ -996,6 +1099,7 @@ def generate_prompts_for_batch(
     for b in blocks:
         item = by_index.get(b.index, {})
         scene_prompt = clean_text(item.get("scene_prompt", "")) or fallback_scene_prompt(b.text, language_code)
+        scene_prompt = sanitize_real_names(scene_prompt, language_code)
         labels = limit_labels_text(clean_text(item.get("labels", "")), language_code)
         frame_type = clean_text(item.get("frame_type", "scene")) or "scene"
 
