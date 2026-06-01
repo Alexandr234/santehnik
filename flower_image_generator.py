@@ -88,7 +88,7 @@ OPERATION_POLL_SEC    = int(os.getenv("FAST_GEN_OPERATION_POLL_SEC", "6"))
 OPERATION_TIMEOUT_SEC = int(os.getenv("FAST_GEN_OPERATION_TIMEOUT_SEC", "1800"))
 RETRY_DELAY_SEC       = int(os.getenv("FAST_GEN_RETRY_DELAY_SEC", "8"))
 MAX_RETRIES           = int(os.getenv("FAST_GEN_MAX_RETRIES", "0"))   # 0 = бесконечно
-MAX_IMAGE_WORKERS     = int(os.getenv("FAST_GEN_IMAGE_WORKERS", "2"))
+MAX_IMAGE_WORKERS     = int(os.getenv("FAST_GEN_IMAGE_WORKERS", "20"))
 
 SKIP_EXISTING = True
 
