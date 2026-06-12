@@ -159,9 +159,10 @@ NEGATIVE_SUFFIX = (
 # ============================================================
 # 3) SCENE DIVERSITY BANKS  (общие, бытовые, с РАЗНЫМИ локациями)
 # ------------------------------------------------------------
-# Это лишь подсказки/запасные варианты. Главным автором сцены является модель,
-# которая опирается на текст озвучки и VIDEO_THEME. Банки нужны для разнообразия
-# и как fallback, если модель вернула пустое поле.
+# ВАЖНО: эти банки модели БОЛЬШЕ НЕ ПОКАЗЫВАЮТСЯ как подсказки — иначе они тянули бы
+# её к заранее заданным местам/предметам. Локацию и реквизит модель выбирает САМА из
+# смысла конкретной реплики. Банки остаются только как тихий fallback в normalize_scene,
+# если модель вдруг вернула пустое или явно generic поле.
 # ============================================================
 SCENE_TYPES: dict[str, dict[str, str]] = {
     "subject_alone": {
@@ -664,11 +665,7 @@ def generate_batch(
         for s in recent_scenes[-8:]
     ]
     rnd = random.Random(len(recent_scenes) * 7 + blocks[0].index)
-    env_pool   = rnd.sample(ENVIRONMENT_BANK, min(8, len(ENVIRONMENT_BANK)))
-    act_pool   = rnd.sample(ACTION_BANK, min(8, len(ACTION_BANK)))
     cam_pool   = rnd.sample(CAMERA_BANK, min(6, len(CAMERA_BANK)))
-    emo_pool   = rnd.sample(EMOTION_BANK, min(6, len(EMOTION_BANK)))
-    sym_pool   = rnd.sample(SYMBOL_BANK, min(7, len(SYMBOL_BANK)))
 
     user_prompt = f"""
 LANGUAGE OF VOICEOVER: {lang_name} ({lang_code})
@@ -681,12 +678,14 @@ AVAILABLE SCENE TYPES:
 
 RECENT SCENES (make the next ones visually different, especially the LOCATION): {json.dumps(recent_compact, ensure_ascii=False)}
 
-INSPIRATION POOL (you may use these or invent your own, as long as they fit the line and the topic):
-  environments: {json.dumps(env_pool)}
-  actions: {json.dumps(act_pool)}
+HOW TO CHOOSE THE LOCATION AND PROPS:
+- Do NOT pick from a fixed list. YOU decide, from the meaning of current_text, the most natural
+  place for the character to be and the object he interacts with. Infer the setting that the line
+  itself implies (e.g. a line about buying -> a shop; about scrolling -> looking at a phone;
+  about home comfort -> a room; about others judging -> a public place with white figures).
+- Invent whatever everyday setting fits best; it does not have to be from any template.
+- These framing options are the ONLY suggestions, and they are purely about camera, not content:
   cameras: {json.dumps(cam_pool)}
-  emotions: {json.dumps(emo_pool)}
-  symbols: {json.dumps(sym_pool)}
 
 VOICEOVER BLOCKS:
 {json.dumps(build_blocks_payload(blocks), ensure_ascii=False, indent=2)}
