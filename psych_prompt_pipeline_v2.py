@@ -122,9 +122,12 @@ ART_STYLE = (
 #   export VIDEO_THEME="..."
 # или флагом:  --theme "..."
 DEFAULT_VIDEO_THEME = (
-    "a calm psychology video about a man who has driven the same old car for ten years; "
-    "themes of consumer culture, constant upgrading, status symbols, social comparison, "
-    "and the quiet inner stability of a person who is content with what he already has"
+    "a calm psychology video about consumer culture and the urge to constantly replace things "
+    "(phones, shoes, furniture, gadgets, cars, even relationships and identity), advertising that "
+    "manufactures dissatisfaction, status symbols and social comparison, and the quiet inner "
+    "stability of a person who is content with what he already has. "
+    "An old car kept for ten years is only the RECURRING EXAMPLE that opens and closes the video — "
+    "it is NOT what every scene is about. Most lines are about consumption in general, not cars."
 )
 VIDEO_THEME = (os.getenv("VIDEO_THEME", "").strip() or DEFAULT_VIDEO_THEME)
 
@@ -221,41 +224,42 @@ DEFAULT_CAMERA_BY_TYPE = {
     "calm_contrast":          "wide shot, calm character still while figures blur past",
 }
 
-# Разнообразные минималистичные локации (дом + улица + авто + дорога + магазин).
-# Намеренно бытовые и общие, чтобы скрипт годился и для других тем.
+# Разнообразные минималистичные БЫТОВЫЕ локации (дом, магазины, улица + ОДНА-две авто).
+# Намеренно общие: машина здесь лишь один из вариантов, а не основа.
 ENVIRONMENT_BANK = [
-    "simple driveway with a plain older car parked on it",
-    "minimal interior of an old car, simple dashboard and steering wheel",
-    "quiet residential street suggested by a sidewalk and one small tree",
-    "clean modern car showroom with one shiny new car",
-    "open road stretching to the horizon under a plain flat sky",
-    "minimal parking lot with a few simple cars",
-    "simple shop interior with plain shelves of products",
-    "plain garage with a few tools on the wall",
-    "sidewalk in front of a simple house",
-    "minimal park suggested by a bench and a single tree",
     "simple living room with a sofa and a low table",
     "simple kitchen with a plain counter and one cup",
+    "minimal bedroom with a bed and a small shelf",
+    "plain shop interior with simple shelves of products",
+    "minimal electronics store wall with a row of identical phones",
+    "simple shoe-shop shelf with a few pairs of shoes",
+    "quiet residential street suggested by a sidewalk and one small tree",
+    "sidewalk in front of a simple house",
+    "minimal park suggested by a bench and a single tree",
     "bare cream room with two walls meeting in a corner and a grey-green floor",
     "wide empty horizon with a flat ground line and open sky",
+    "simple driveway with a plain older car parked on it",
+    "minimal interior of an old car, simple dashboard and steering wheel",
+    "small living room glowing from a TV showing an advert",
 ]
 
 # Простые, читаемые действия и жесты (бытовые, по теме «вещи / выбор / спокойствие»).
+# Общие, НЕ привязанные к машине: предмет в руках зависит от конкретной реплики.
 ACTION_BANK = [
     "standing calmly with a relaxed, easy posture",
-    "resting one hand fondly on an old parked car",
-    "gripping a steering wheel while calmly driving",
-    "closing a car door with a familiar, practiced motion",
-    "glancing at a shiny new car with calm indifference",
+    "holding an old worn phone while ignoring a shiny new one",
+    "looking at a wall of identical new products without reaching for any",
     "shrugging lightly in answer to a question",
-    "standing still and content while white figures rush past",
+    "standing still and content while white figures rush past with shopping bags",
     "walking calmly down a simple street",
     "sitting relaxed and looking thoughtfully into the distance",
     "crossing his arms with quiet confidence",
-    "looking at many new products without reaching for any",
-    "patting the worn dashboard of his old car",
-    "watching a white figure drive away in a brand-new car",
+    "watching a glowing advert on a screen with a calm face",
+    "keeping a familiar old object while others hold shiny new ones",
+    "fondly using a well-worn everyday object",
     "standing between an old thing and a new shiny one, choosing the old",
+    "resting one hand fondly on his old car (only when the line is about the car)",
+    "calmly driving his old car (only when the line is about the car)",
 ]
 
 # Варианты кадрирования (почти всегда полный рост, на уровне глаз).
@@ -608,11 +612,14 @@ OTHER PEOPLE: {OTHERS_STYLE}.
 Your job: for each spoken line, design ONE clear cartoon scene that VISUALLY COMMUNICATES the meaning
 of that line, grounded in the video's topic above.
 
-CRITICAL RULES ABOUT LOCATION:
-- Do NOT keep the character in the same place every time. CHANGE the environment from scene to scene.
-- Put him in concrete everyday locations that fit the line and the topic
-  (for the car topic: driveway, inside the old car, a street, a car showroom, the open road,
-   a parking lot, a shop full of new products, his home, etc.).
+CRITICAL RULES ABOUT WHAT TO SHOW:
+- Illustrate the SPECIFIC current line, not the overall topic. Whatever object that line mentions
+  (a phone, shoes, furniture, a gadget, an advert, a crowd, money, an identity) is what should appear.
+- Do NOT put a car in every scene. Show the car ONLY when the current line literally talks about the car
+  or about driving. For all other lines use the object that line is actually about. The old car is just
+  the opening/closing example of the video, not a default prop.
+- Do NOT keep the character in the same place every time. CHANGE the environment from scene to scene
+  (living room, shop, electronics store, street, his home, a bare room, etc.).
 - The room with bare cream walls is just ONE possible location, not the default. Avoid reusing it repeatedly.
 
 OTHER GUIDANCE:
@@ -709,7 +716,9 @@ Return JSON:
 Rules:
 - Exactly one item per block. All items in English.
 - subject must start with "the main character" and describe pose/expression only (do NOT describe clothing or art style).
-- CHANGE the environment across consecutive scenes; place him in locations that fit the topic, not always a bare room.
+- Illustrate the SPECIFIC current_text. Show whatever object that line is about (phone, shoes, furniture, advert, crowd, money...).
+- Do NOT show a car unless current_text is literally about the car or driving. The car is only the opening/closing example.
+- CHANGE the environment across consecutive scenes; place him in locations that fit the line, not always a bare room.
 - Other people, when present, must be blank white figures. Use them when the line is about other people; otherwise "none".
 - Use a symbol only when it truly helps; otherwise "no symbol".
 - Keep environments simple and minimalist (few props, lots of empty space). No realistic, cluttered, or photographic settings.
@@ -816,26 +825,26 @@ def normalize_scene(raw: dict, b: VisualBlock, recent: list[dict], salt: int) ->
 
 
 FALLBACK_SCENES = [
-    {"scene_type": "with_object", "subject": "the main character resting a hand on his old car",
+    {"scene_type": "with_object", "subject": "the main character holding a worn everyday object he keeps",
      "others": "none", "symbol": "no symbol",
-     "environment": "simple driveway with a plain older car parked on it",
-     "action": "resting one hand fondly on an old parked car",
+     "environment": "simple living room with a sofa and a low table",
+     "action": "fondly using a well-worn everyday object",
      "emotion": "calm contentment", "camera_framing": "full-body medium-wide shot showing the character and the object"},
     {"scene_type": "calm_contrast", "subject": "the main character standing calm and still",
-     "others": "several blank white figures rush past toward new shiny cars", "symbol": "no symbol",
-     "environment": "minimal parking lot with a few simple cars",
-     "action": "standing still and content while white figures rush past",
+     "others": "several blank white figures rush past carrying shopping bags", "symbol": "no symbol",
+     "environment": "plain shop interior with simple shelves of products",
+     "action": "standing still and content while white figures rush past with shopping bags",
      "emotion": "unbothered ease", "camera_framing": "wide shot, calm character still while figures blur past"},
-    {"scene_type": "in_transit", "subject": "the main character calmly driving",
-     "others": "none", "symbol": "no symbol",
-     "environment": "open road stretching to the horizon under a plain flat sky",
-     "action": "gripping a steering wheel while calmly driving",
-     "emotion": "relaxed familiarity", "camera_framing": "side-on wide shot showing motion"},
-    {"scene_type": "comparison_split", "subject": "the main character beside his old car looking at a new one",
-     "others": "none", "symbol": "a shiny 'new' sparkle effect on an object",
-     "environment": "clean modern car showroom with one shiny new car",
-     "action": "glancing at a shiny new car with calm indifference",
-     "emotion": "quiet confidence", "camera_framing": "wide shot with both sides framed for contrast"},
+    {"scene_type": "surrounded_by_choices", "subject": "the main character calmly facing a wall of new products",
+     "others": "none", "symbol": "a row of identical shiny new products",
+     "environment": "minimal electronics store wall with a row of identical phones",
+     "action": "looking at a wall of identical new products without reaching for any",
+     "emotion": "indifference to trends", "camera_framing": "wide shot with the character among many objects"},
+    {"scene_type": "symbolic_metaphor", "subject": "the main character standing grounded and still",
+     "others": "none", "symbol": "a treadmill / hamster-wheel symbol of endless upgrading",
+     "environment": "bare cream room with two walls meeting in a corner and a grey-green floor",
+     "action": "standing calmly with a relaxed, easy posture",
+     "emotion": "settled inner stability", "camera_framing": "medium full-body shot, the floating symbol clearly visible"},
 ]
 
 
