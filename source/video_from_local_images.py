@@ -13,14 +13,14 @@
    то берёт промпт по номеру картинки (0001 -> 1-й промпт, 0002 -> 2-й и т.д.)
 4. Если промпта для картинки нет — использует DEFAULT_ANIMATION_PROMPT
 5. Отправляет картинку прямо в запрос как data:image/...;base64,...
-   (без upload в storage и без file:...)
+   (без upload в storage и без file:...) через провайдера Flower (Veo 3.1)
 6. Работает в несколько потоков
 7. Учитывает лимит стартов видео в час
 
-Соответствует актуальной документации media_gen_api:
-- POST /api/v4/flow/video/from-ingredients
-    body: { "prompt": str, "reference_images": [ImageInput, ...1-3],
-            "aspect_ratio": "16:9" | "9:16", "seed": int? }
+Соответствует актуальной документации media_gen_api (провайдер Flower, Veo 3.1):
+- POST /api/v4/flower/video/from-image
+    body: { "image": ImageInput, "prompt": str,
+            "aspect_ratio": "16:9" | "9:16" }
     -> { "success": true, "operation_id": str,
          "operation_type": str, "status": "pending" }
 - GET  /api/v4/operations/{operation_id}?result_format=ref|data_uri
@@ -78,9 +78,6 @@ MAX_RETRIES = 4
 
 # Допустимые значения по новой документации: "16:9" (1280x720) или "9:16" (720x1280).
 ASPECT_RATIO = "16:9"
-
-# Опциональный seed для воспроизводимости (0..2147483647) или None.
-SEED: Optional[int] = None
 
 MAX_VIDEO_STARTS_PER_HOUR = 150
 RATE_WINDOW_SECONDS = 3600
@@ -417,18 +414,16 @@ video_rate_limiter = HourlyRateLimiter(
 # =========================================================
 
 def build_payload(prompt: str, image_data_uri: str) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
+    # Flower (Veo 3.1): одна картинка в поле "image", prompt обязателен.
+    return {
+        "image": image_data_uri,
         "prompt": prompt,
-        "reference_images": [image_data_uri],
         "aspect_ratio": ASPECT_RATIO,
     }
-    if SEED is not None:
-        payload["seed"] = SEED
-    return payload
 
 
-def start_video_from_ingredients(prompt: str, image_data_uri: str) -> str:
-    url = normalize_base_url(BASE_URL) + "/api/v4/flow/video/from-ingredients"
+def start_video_from_image(prompt: str, image_data_uri: str) -> str:
+    url = normalize_base_url(BASE_URL) + "/api/v4/flower/video/from-image"
     payload = build_payload(prompt, image_data_uri)
 
     resp = request_with_retries(
@@ -441,7 +436,7 @@ def start_video_from_ingredients(prompt: str, image_data_uri: str) -> str:
     data = safe_json(resp)
     operation_id = extract_operation_id(data)
     if not operation_id:
-        raise RuntimeError(f"Не удалось получить operation_id из ответа from-ingredients: {data}")
+        raise RuntimeError(f"Не удалось получить operation_id из ответа flower/video/from-image: {data}")
     return operation_id
 
 
@@ -546,7 +541,7 @@ def process_scene_item(item: SceneItem) -> None:
         image_data_uri = image_to_data_uri(item.image_path)
 
         video_rate_limiter.acquire(item.scene_index)
-        operation_id = start_video_from_ingredients(item.prompt, image_data_uri)
+        operation_id = start_video_from_image(item.prompt, image_data_uri)
 
         op_result = poll_operation(operation_id, item.scene_index)
         video_source = extract_video_source(op_result)
@@ -599,7 +594,7 @@ def main() -> None:
     log(f"[INFO] Лимит: {MAX_VIDEO_STARTS_PER_HOUR} стартов видео в час")
     log(f"[INFO] Aspect ratio: {ASPECT_RATIO}")
     log(f"[INFO] Result format: {RESULT_FORMAT}")
-    log("[INFO] Режим: local image -> base64 -> /api/v4/flow/video/from-ingredients")
+    log("[INFO] Режим: local image -> base64 -> /api/v4/flower/video/from-image (Veo 3.1)")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_scene_item, item) for item in scenes]
