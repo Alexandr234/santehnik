@@ -17,20 +17,18 @@
 6. Работает в несколько потоков
 7. Учитывает лимит стартов видео в час
 
-Соответствует актуальной документации media_gen_api (провайдер Flower, Veo 3.1):
-- POST /api/v4/flower/video/from-image
-    body: { "image": ImageInput, "prompt": str,
-            "aspect_ratio": "16:9" | "9:16" }
-    -> { "success": true, "operation_id": str,
-         "operation_type": str, "status": "pending" }
-- GET  /api/v4/operations/{operation_id}?result_format=ref|data_uri
-    -> { "status": "pending"|"processing"|"success"|"error",
-         "result": [str, ...], "error": str? }
+Соответствует актуальной документации media_gen_api (V5, модель Veo 3.1 light):
+- GET  /api/v5/models?media_type=video  -> список моделей (берём id нужной модели)
+- POST /api/v5/generations
+    body: { "model": str, "prompt": str, "inputs": [data:image...],
+            "aspect_ratio": "16:9" | "9:16", "resolution": str? }
+    -> { "id": str, "status": "queued", ... }
+- GET  /api/v5/generations/{id}
+    -> { "status": "queued"|"running"|"succeeded"|"failed",
+         "results": [{ "download_path": str?, "data": str?, ... }], "error": str? }
 
-При result_format=ref в result приходят ссылки вида file:<hash>, которые
-скачиваются со storage-сервера: GET {STORAGE_URL}/file/{hash}/raw
-(удобно для видео — не тянем гигантский data URI). По умолчанию в result
-приходят data:video/...;base64,... — это тоже поддерживается.
+Видео в результате приходит либо как download_path (путь на storage-сервере,
+качаем {STORAGE_URL}{download_path}), либо инлайном в поле data (data:video/...).
 """
 
 from __future__ import annotations
@@ -79,6 +77,14 @@ MAX_RETRIES = 4
 # Допустимые значения по новой документации: "16:9" (1280x720) или "9:16" (720x1280).
 ASPECT_RATIO = "16:9"
 
+# Желаемая модель V5. Можно указать точный id (из GET /api/v5/models) или
+# свободную фразу — скрипт сам найдёт подходящую видео-модель по id/названию.
+# Здесь нужна "Veo 3.1 light".
+MODEL = "veo 3.1 light"
+
+# Опциональное разрешение, если модель его поддерживает ("480p"/"720p"). None — по умолчанию.
+RESOLUTION: Optional[str] = None
+
 MAX_VIDEO_STARTS_PER_HOUR = 150
 RATE_WINDOW_SECONDS = 3600
 
@@ -90,12 +96,8 @@ DEFAULT_ANIMATION_PROMPT = (
     "natural details, preserve the original composition, subject, lighting and style."
 )
 
-# По схеме API (ImageInput) максимум 5 MB на одну картинку.
+# Инлайн-картинки в V5 ограничены 5 MB.
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-
-# Просим сервер вернуть ссылки file:<hash> (легче для видео), а потом скачиваем
-# их со storage-сервера. Если поставить "data_uri" — видео придёт инлайном base64.
-RESULT_FORMAT = "ref"
 
 
 # =========================================================
@@ -272,83 +274,66 @@ def image_to_data_uri(image_path: Path) -> str:
 # РАЗБОР ОТВЕТОВ API
 # =========================================================
 
-def extract_operation_id(data: Dict[str, Any]) -> Optional[str]:
-    """operation_id из OperationResponse (POST .../from-ingredients)."""
-    op_id = data.get("operation_id")
-    if isinstance(op_id, str) and op_id.strip():
-        return op_id.strip()
-    # На всякий случай — вложенные варианты.
-    for key in ("data", "result", "operation"):
-        nested = data.get(key)
-        if isinstance(nested, dict):
-            cand = nested.get("operation_id") or nested.get("id")
-            if isinstance(cand, str) and cand.strip():
-                return cand.strip()
+def extract_generation_id(data: Dict[str, Any]) -> Optional[str]:
+    """id из GenerationAcceptedResponse (POST /api/v5/generations)."""
+    gen_id = data.get("id")
+    if isinstance(gen_id, str) and gen_id.strip():
+        return gen_id.strip()
     return None
 
 
 def extract_video_source(data: Dict[str, Any]) -> str:
-    """Достаёт источник видео из OperationStatusResponse.result.
+    """Достаёт источник видео из GenerationStatusResponse.results.
 
-    result — список строк. Каждый элемент может быть:
-      - "data:video/...;base64,..."  (result_format=data_uri)
-      - "file:<32 hex>"              (result_format=ref) -> качаем со storage
-      - http(s)://...                (прямая ссылка на файл)
+    Каждый элемент results может содержать:
+      - download_path: путь на storage-сервере -> качаем {STORAGE_URL}{path}
+      - data: инлайн "data:video/...;base64,..."
     """
-    result = data.get("result")
-    if not isinstance(result, list) or not result:
+    results = data.get("results")
+    if not isinstance(results, list) or not results:
         raise RuntimeError(
-            f"В ответе нет result с видео: {json.dumps(data, ensure_ascii=False)[:2000]}"
+            f"В ответе нет results с видео: {json.dumps(data, ensure_ascii=False)[:2000]}"
         )
 
-    for item in result:
-        if not isinstance(item, str):
-            continue
-        s = item.strip()
-        if s.startswith("data:video/"):
-            return s
-        if re.match(r"^file:[a-f0-9]{32}$", s):
-            return s
-        if re.match(r"^https?://", s, flags=re.IGNORECASE):
-            return s
+    # Сначала ищем видео-элемент, затем любой с источником.
+    candidates = [r for r in results if isinstance(r, dict) and r.get("type") == "video"]
+    candidates += [r for r in results if isinstance(r, dict) and r not in candidates]
 
-    # Фолбэк: вернём первый строковый элемент как есть.
-    for item in result:
-        if isinstance(item, str) and item.strip():
-            return item.strip()
+    for item in candidates:
+        download_path = item.get("download_path")
+        if isinstance(download_path, str) and download_path.strip():
+            return download_path.strip()
+        data_uri = item.get("data")
+        if isinstance(data_uri, str) and data_uri.strip():
+            return data_uri.strip()
 
     raise RuntimeError(
-        f"Не удалось найти video source в result: {json.dumps(data, ensure_ascii=False)[:2000]}"
+        f"Не удалось найти video source в results: {json.dumps(data, ensure_ascii=False)[:2000]}"
     )
 
 
+def _download_to(url: str, out_path: Path) -> None:
+    with requests.get(url, headers=auth_headers(), stream=True, timeout=REQUEST_TIMEOUT) as r:
+        r.raise_for_status()
+        with out_path.open("wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+
 def save_video_from_source(source: str, out_path: Path) -> None:
-    if source.startswith("data:video/"):
+    if source.startswith("data:video/") or source.startswith("data:"):
         _, b64 = source.split(",", 1)
         out_path.write_bytes(base64.b64decode(b64))
         return
 
-    if source.startswith("file:"):
-        file_hash = source[len("file:"):]
-        url = normalize_base_url(STORAGE_URL) + f"/file/{file_hash}/raw"
-        with requests.get(url, headers=auth_headers(), stream=True, timeout=REQUEST_TIMEOUT) as r:
-            r.raise_for_status()
-            with out_path.open("wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-        return
-
     if source.startswith("http://") or source.startswith("https://"):
-        with requests.get(source, stream=True, timeout=REQUEST_TIMEOUT) as r:
-            r.raise_for_status()
-            with out_path.open("wb") as f:
-                for chunk in r.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
+        _download_to(source, out_path)
         return
 
-    raise RuntimeError(f"Неподдерживаемый формат video source: {source[:300]}")
+    # download_path со storage-сервера (например "/file/<hash>/raw").
+    path = source if source.startswith("/") else "/" + source
+    _download_to(normalize_base_url(STORAGE_URL) + path, out_path)
 
 
 # =========================================================
@@ -410,21 +395,80 @@ video_rate_limiter = HourlyRateLimiter(
 
 
 # =========================================================
-# FLOW VIDEO START / POLL
+# V5: ВЫБОР МОДЕЛИ
 # =========================================================
 
-def build_payload(prompt: str, image_data_uri: str) -> Dict[str, Any]:
-    # Flower (Veo 3.1): одна картинка в поле "image", prompt обязателен.
-    return {
-        "image": image_data_uri,
+def _normalize(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", s.lower())
+
+
+def resolve_model_id(desired: str) -> str:
+    """Находит точный V5 id видео-модели по id или названию (фразе).
+
+    Если совпадение неоднозначно или не найдено — печатает список доступных
+    видео-моделей и бросает исключение, чтобы можно было задать точный id.
+    """
+    url = normalize_base_url(BASE_URL) + "/api/v5/models"
+    resp = request_with_retries(
+        "GET", url, headers=auth_headers(), params={"media_type": "video"}
+    )
+    data = safe_json(resp)
+    models = data if isinstance(data, list) else data.get("data") or []
+
+    available = []
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id")
+        if isinstance(mid, str):
+            available.append((mid, m.get("display_name") or "", bool(m.get("deprecated"))))
+
+    # 1) Точное совпадение по id.
+    for mid, _name, _dep in available:
+        if mid == desired:
+            return mid
+
+    # 2) Фаззи-совпадение по id/названию.
+    want = _normalize(desired)
+    matches = [
+        mid for mid, name, dep in available
+        if not dep and (want in _normalize(mid) or want in _normalize(name))
+    ]
+    if len(matches) == 1:
+        return matches[0]
+
+    listing = "\n".join(f"  - id={mid!r}  name={name!r}" for mid, name, _ in available)
+    if not matches:
+        raise RuntimeError(
+            f"Модель '{desired}' не найдена среди видео-моделей. Доступные:\n{listing}\n"
+            f"Укажи точный id в константе MODEL."
+        )
+    raise RuntimeError(
+        f"Под '{desired}' подходит несколько моделей: {matches}.\n{listing}\n"
+        f"Укажи точный id в константе MODEL."
+    )
+
+
+# =========================================================
+# V5: GENERATION START / POLL
+# =========================================================
+
+def build_payload(model_id: str, prompt: str, image_data_uri: str) -> Dict[str, Any]:
+    # V5: одна картинка передаётся в inputs (data URI), prompt обязателен.
+    payload: Dict[str, Any] = {
+        "model": model_id,
         "prompt": prompt,
+        "inputs": [image_data_uri],
         "aspect_ratio": ASPECT_RATIO,
     }
+    if RESOLUTION:
+        payload["resolution"] = RESOLUTION
+    return payload
 
 
-def start_video_from_image(prompt: str, image_data_uri: str) -> str:
-    url = normalize_base_url(BASE_URL) + "/api/v4/flower/video/from-image"
-    payload = build_payload(prompt, image_data_uri)
+def start_generation(model_id: str, prompt: str, image_data_uri: str) -> str:
+    url = normalize_base_url(BASE_URL) + "/api/v5/generations"
+    payload = build_payload(model_id, prompt, image_data_uri)
 
     resp = request_with_retries(
         "POST",
@@ -434,15 +478,14 @@ def start_video_from_image(prompt: str, image_data_uri: str) -> str:
     )
 
     data = safe_json(resp)
-    operation_id = extract_operation_id(data)
-    if not operation_id:
-        raise RuntimeError(f"Не удалось получить operation_id из ответа flower/video/from-image: {data}")
-    return operation_id
+    generation_id = extract_generation_id(data)
+    if not generation_id:
+        raise RuntimeError(f"Не удалось получить id из ответа /api/v5/generations: {data}")
+    return generation_id
 
 
-def poll_operation(operation_id: str, scene_index: int) -> Dict[str, Any]:
-    url = normalize_base_url(BASE_URL) + f"/api/v4/operations/{operation_id}"
-    params = {"result_format": RESULT_FORMAT}
+def poll_operation(generation_id: str, scene_index: int) -> Dict[str, Any]:
+    url = normalize_base_url(BASE_URL) + f"/api/v5/generations/{generation_id}"
 
     started = time.time()
     last_status = None
@@ -452,30 +495,30 @@ def poll_operation(operation_id: str, scene_index: int) -> Dict[str, Any]:
         elapsed = int(time.time() - started)
         if elapsed > POLL_TIMEOUT:
             raise TimeoutError(
-                f"[TIMEOUT] {scene_index:04d}: операция {operation_id} не завершилась за {POLL_TIMEOUT} сек"
+                f"[TIMEOUT] {scene_index:04d}: генерация {generation_id} не завершилась за {POLL_TIMEOUT} сек"
             )
 
-        resp = request_with_retries("GET", url, headers=auth_headers(), params=params)
+        resp = request_with_retries("GET", url, headers=auth_headers())
 
         data = safe_json(resp)
         status = str(data.get("status") or "unknown").strip().lower()
 
         now = time.time()
         if status != last_status or (now - last_log_time) >= STATUS_LOG_EVERY:
-            log(f"[WAIT] {scene_index:04d}: operation {operation_id}, status={status}, elapsed={elapsed}s")
+            log(f"[WAIT] {scene_index:04d}: generation {generation_id}, status={status}, elapsed={elapsed}s")
             last_status = status
             last_log_time = now
 
-        if status == "success":
+        if status == "succeeded":
             return data
 
-        if status == "error":
+        if status == "failed":
             err = data.get("error") or data
             raise RuntimeError(
-                f"[ERROR] {scene_index:04d}: операция {operation_id} завершилась с ошибкой: {err}"
+                f"[ERROR] {scene_index:04d}: генерация {generation_id} завершилась с ошибкой: {err}"
             )
 
-        # pending / processing / unknown -> ждём дальше
+        # queued / running / unknown -> ждём дальше
         time.sleep(POLL_INTERVAL)
 
 
@@ -484,6 +527,9 @@ def poll_operation(operation_id: str, scene_index: int) -> Dict[str, Any]:
 # =========================================================
 
 results_log: List[Dict[str, Any]] = []
+
+# Реальный id модели V5, определяется в main() через resolve_model_id().
+RESOLVED_MODEL_ID: str = ""
 
 
 def append_result_log(item: Dict[str, Any]) -> None:
@@ -541,9 +587,9 @@ def process_scene_item(item: SceneItem) -> None:
         image_data_uri = image_to_data_uri(item.image_path)
 
         video_rate_limiter.acquire(item.scene_index)
-        operation_id = start_video_from_image(item.prompt, image_data_uri)
+        generation_id = start_generation(RESOLVED_MODEL_ID, item.prompt, image_data_uri)
 
-        op_result = poll_operation(operation_id, item.scene_index)
+        op_result = poll_operation(generation_id, item.scene_index)
         video_source = extract_video_source(op_result)
         save_video_from_source(video_source, out_path)
 
@@ -552,9 +598,10 @@ def process_scene_item(item: SceneItem) -> None:
         append_result_log({
             "scene_index": item.scene_index,
             "status": "done",
-            "mode": "image_to_video_base64",
+            "mode": "image_to_video_v5",
+            "model": RESOLVED_MODEL_ID,
             "output": str(out_path),
-            "operation_id": operation_id,
+            "generation_id": generation_id,
             "image": str(item.image_path),
             "prompt": item.prompt,
         })
@@ -581,9 +628,11 @@ def main() -> None:
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
 
-    global results_log
+    global results_log, RESOLVED_MODEL_ID
     loaded_log = load_json(LOG_FILE, [])
     results_log = loaded_log if isinstance(loaded_log, list) else []
+
+    RESOLVED_MODEL_ID = resolve_model_id(MODEL)
 
     scenes = build_scene_items()
 
@@ -593,8 +642,8 @@ def main() -> None:
     log(f"[INFO] Потоков: {MAX_WORKERS}")
     log(f"[INFO] Лимит: {MAX_VIDEO_STARTS_PER_HOUR} стартов видео в час")
     log(f"[INFO] Aspect ratio: {ASPECT_RATIO}")
-    log(f"[INFO] Result format: {RESULT_FORMAT}")
-    log("[INFO] Режим: local image -> base64 -> /api/v4/flower/video/from-image (Veo 3.1)")
+    log(f"[INFO] Модель: {MODEL!r} -> {RESOLVED_MODEL_ID!r}")
+    log("[INFO] Режим: local image -> base64 -> /api/v5/generations (Veo 3.1 light)")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = [executor.submit(process_scene_item, item) for item in scenes]
