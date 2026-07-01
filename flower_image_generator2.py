@@ -1,49 +1,54 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DE/PL/RU IMAGE generator — Fast-Gen V4 (Flower / Flow), БЕЗ привязки к персонажу.
+DE/PL/RU IMAGE generator — Fast-Gen V6, БЕЗ привязки к персонажу.
 
-Эта версия генерирует картинки ЧИСТО ИЗ ТЕКСТОВЫХ ПРОМПТОВ (text-to-image).
-Никакого reference-изображения персонажа и никакой «фиксации лица» больше нет —
-каждый кадр рисуется свободно по своему промпту (эпичный живописный стиль,
-анонимные силуэты / чистые пейзажи из psych_prompt_pipeline).
+Генерирует картинки ЧИСТО ИЗ ТЕКСТОВЫХ ПРОМПТОВ (text-to-image). Никакого
+reference-изображения персонажа и «фиксации лица» — каждый кадр рисуется свободно
+по своему промпту (эпичный живописный стиль из psych_prompt_pipeline).
 
-Эндпоинты (media_gen_api, openapi 3.1.0):
-  • /api/v4/flower/image/generate  (FlowerGenerateImageRequest)
-      prompt, aspect_ratio (16:9 | 9:16 | 1:1). Без reference_image это обычная
-      text-to-image генерация — 1 кредит, aspect_ratio соблюдается.
-  • /api/v4/flow/image/generate    (FlowGenerateImageRequest)
-      prompt, aspect_ratio (16:9 | 4:3 | 1:1 | 3:4 | 9:16),
-      model (GEM_PIX_2 | IMAGEN_3_5 | NARWHAL), seed (0..2147483647),
-      generation_config.upscale.type="2x" (апскейл x2, удваивает кредиты). 4 кредита/картинка.
-  • Опрос:    /api/v4/operations/{operation_id}?result_format=ref|data_uri
-      OperationStatusResponse: status, result (СПИСОК строк), warnings, error, translations.
+ОБНОВЛЕНО ПОД V6 (media_gen_api, openapi 1.11). Старые пути /api/v4/... удалены —
+поэтому раньше был HTTP 404. Теперь всё идёт через единый эндпоинт:
 
-Читает промпты из ТРЁХ отдельных файлов (генерирует psych_prompt_pipeline):
-  ПРОМПТЫ/prompts_de.txt
-  ПРОМПТЫ/prompts_pl.txt
-  ПРОМПТЫ/prompts_ru.txt
+  • POST /api/v6/generations           (GenerationCreateRequest)
+      prompt (обяз.), operation (canonical id, напр. "flower_image_generate"),
+      aspect_ratio (любой n:n, дефолт "16:9"), seed (0..2147483647),
+      quality ("speed"|"quality" — для grok/openai),
+      generation_config.upscale.type="2x" (для flow/nano image, удваивает кредиты).
+      Ответ: GenerationAcceptedResponse -> поле "id" (id генерации).
+  • GET  /api/v6/generations/{id}      (GenerationStatusResponse)
+      status: queued | running | succeeded | failed,
+      results[]: { type, download_url, data (inline data URI), mime_type, metadata },
+      error, warnings, translations.
 
-Для каждого языка генерирует СВОИ картинки:
-  ВИЗУАЛ/DE/001.png, 002.png ...
-  ВИЗУАЛ/PL/001.png, 002.png ...
-  ВИЗУАЛ/RU/001.png, 002.png ...
+Операции для картинок (text-to-image) и их цена:
+  flower_image_generate         — flower/flower-image      — 1 кредит      (дефолт, дёшево)
+  grok_image_generate           — grok/grok-image          — 1 (speed) / 3 (quality)
+  openai_image_generate         — openai/openai-image      — 2 кредита
+  nano_banana_2_image_generate  — flow/nano-banana-2        — 4 (base) / 8 (2x)
+  nano_banana_pro_image_generate— flow/nano-banana-pro      — 4 (base) / 8 (2x)
 
-Имена файлов (001.png) соответствуют полю image_filename из image_times_{lang}.json.
+Читает промпты из ТРЁХ файлов psych_prompt_pipeline:
+  ПРОМПТЫ/prompts_de.txt · prompts_pl.txt · prompts_ru.txt
+Кладёт картинки в:
+  ВИЗУАЛ/DE/001.png · ВИЗУАЛ/PL/001.png · ВИЗУАЛ/RU/001.png
+(имена 001.png соответствуют image_filename из image_times_{lang}.json).
 
 Быстрый запуск:
   cd "/Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/ВИЗУАЛ"
   python3 flower_image_generator2.py --workers 2
 
 Флаги:
-  --workers N        параллельных задач (начни с 1-2, снизь если 429)
-  --lang DE PL RU    обработать только нужные языки
-  --engine flow|flower
-  --flow-model NARWHAL|GEM_PIX_2|IMAGEN_3_5
-  --seed N           фиксированный seed (flow), -1 = случайный
-  --upscale          flow: вернуть 2x-апскейл (удваивает кредиты)
-  --no-skip          перегенерировать уже существующие
-  --dry-run          только показать промпты, API не вызывать
+  --workers N            параллельных задач (начни с 1-2, снизь если 429)
+  --lang DE PL RU        обработать только нужные языки
+  --engine flower|nano2|nano-pro|grok|openai   (какой движок/операция; дефолт flower = 1 кредит)
+  --operation <id>       напрямую задать canonical V6 operation id (перекрывает --engine)
+  --quality speed|quality   для grok/openai
+  --seed N               фиксированный seed, -1 = случайный
+  --upscale              2x-апскейл (только nano/flow, удваивает кредиты)
+  --aspect-ratio 16:9    любой n:n
+  --no-skip              перегенерировать уже существующие
+  --dry-run              только показать промпты, API не вызывать
 """
 
 from __future__ import annotations
@@ -54,7 +59,6 @@ import csv
 import json
 import os
 import re
-import shutil
 import sys
 import time
 import unicodedata
@@ -97,35 +101,38 @@ PROMPTS_FILE_BY_LANG: Dict[str, Path] = {
 LOCALES = ["DE", "PL", "RU"]
 
 ASPECT_RATIO = os.getenv("FAST_GEN_IMAGE_ASPECT_RATIO", "16:9")
+# V6 принимает любой n:n. Проверяем базово, чтобы не ловить 422.
+ASPECT_RATIO_RE = re.compile(r"^[1-9]\d*:[1-9]\d*$")
 
-# Допустимые aspect_ratio по эндпоинтам (из новой OpenAPI):
-FLOW_ASPECT_RATIOS   = {"16:9", "4:3", "1:1", "3:4", "9:16"}   # FlowGenerateImageRequest
-FLOWER_ASPECT_RATIOS = {"16:9", "9:16", "1:1"}                 # FlowerGenerateImageRequest
+# Дружелюбные имена движков -> canonical V6 operation id для text-to-image.
+ENGINE_TO_OPERATION: Dict[str, str] = {
+    "flower":   "flower_image_generate",           # 1 кредит (дёшево, дефолт)
+    "grok":     "grok_image_generate",             # 1/3 кредита
+    "openai":   "openai_image_generate",           # 2 кредита
+    "nano2":    "nano_banana_2_image_generate",    # 4/8 кредитов
+    "nano-pro": "nano_banana_pro_image_generate",  # 4/8 кредитов
+}
+# Операции, которые поддерживают 2x-апскейл (flow image модели).
+UPSCALE_CAPABLE = {"nano_banana_2_image_generate", "nano_banana_pro_image_generate"}
 
-# Движок генерации (обе опции теперь работают как чистый text-to-image, без референса):
-#   "flower" -> /api/v4/flower/image/generate — text-to-image, 1 кредит/картинка.
-#   "flow"   -> /api/v4/flow/image/generate   — text-to-image, модель на выбор,
-#               seed для воспроизводимости, опциональный апскейл x2. 4 кредита/картинка.
-IMAGE_ENGINE = os.getenv("FAST_GEN_IMAGE_ENGINE", "flower").strip().lower() or "flower"
+# Движок/операция по умолчанию — самый дешёвый text-to-image.
+IMAGE_ENGINE   = os.getenv("FAST_GEN_IMAGE_ENGINE", "flower").strip().lower() or "flower"
+IMAGE_OPERATION = os.getenv("FAST_GEN_IMAGE_OPERATION", "").strip()  # если задано — перекрывает engine
+IMAGE_QUALITY  = os.getenv("FAST_GEN_IMAGE_QUALITY", "").strip()      # speed|quality (grok/openai)
 
-# Модель для flow: NARWHAL (Nano Banana 2), GEM_PIX_2 (Nano Pro), IMAGEN_3_5 (Imagen 4)
-FLOW_MODEL = os.getenv("FAST_GEN_FLOW_MODEL", "NARWHAL").strip() or "NARWHAL"
-
-# Допустимый диапазон seed по новой схеме: 0 .. 2147483647.
+# Допустимый диапазон seed: 0 .. 2147483647.
 SEED_MAX = 2147483647
 
-# Seed нужен только для ВОСПРОИЗВОДИМОСТИ конкретного кадра (перегенерировать один и тот же
-# результат). Персонажа больше нет, поэтому по умолчанию seed НЕ фиксируем — каждый кадр
-# получает свободную композицию. Пусто/<0 = случайный seed.
+# Seed нужен только для ВОСПРОИЗВОДИМОСТИ конкретного кадра. По умолчанию не фиксируем.
 _SEED_RAW = os.getenv("FAST_GEN_SEED", "").strip()
-REFERENCE_SEED: Optional[int] = (
+IMAGE_SEED: Optional[int] = (
     min(int(_SEED_RAW), SEED_MAX)
     if _SEED_RAW.lstrip("-").isdigit() and int(_SEED_RAW) >= 0
     else None
 )
 
-# flow: апскейл x2 (generation_config.upscale.type="2x"). Удваивает кредиты и rate-limit.
-FLOW_UPSCALE_2X = os.getenv("FAST_GEN_FLOW_UPSCALE_2X", "").strip().lower() in {"1", "true", "yes", "on"}
+# 2x-апскейл (generation_config.upscale.type="2x"). Удваивает кредиты и rate-limit.
+IMAGE_UPSCALE_2X = os.getenv("FAST_GEN_UPSCALE_2X", "").strip().lower() in {"1", "true", "yes", "on"}
 
 REQUEST_TIMEOUT       = int(os.getenv("FAST_GEN_REQUEST_TIMEOUT", "300"))
 OPERATION_POLL_SEC    = int(os.getenv("FAST_GEN_OPERATION_POLL_SEC", "6"))
@@ -136,12 +143,9 @@ MAX_IMAGE_WORKERS     = int(os.getenv("FAST_GEN_IMAGE_WORKERS", "20"))
 
 SKIP_EXISTING = True
 
-FLOWER_IMAGE_ENDPOINT = "/api/v4/flower/image/generate"
-FLOW_IMAGE_ENDPOINT   = "/api/v4/flow/image/generate"
-V4_OPERATION_ENDPOINT = "/api/v4/operations/{operation_id}"
-
-# Хранилище нужно только для СКАЧИВАНИЯ результата, когда API возвращает file:<hash>.
-STORAGE_GET_URL = "https://storage.fast-gen.ai/file/{file_hash}"
+# V6 эндпоинты.
+V6_GENERATIONS_ENDPOINT = "/api/v6/generations"
+V6_GENERATION_STATUS    = "/api/v6/generations/{generation_id}"
 
 
 # =========================
@@ -263,14 +267,7 @@ PSYCH_HEADER_RE = re.compile(
 
 
 def parse_psych_pipeline_format(lines: List[str]) -> List[PromptItem]:
-    """
-    Парсит формат psych_prompt_pipeline:
-      001 | 00:00:00,000 --> 00:00:02,350 | 2.35s | scene_type
-      TEXT: озвучка
-      image prompt текст
-      (пустая строка)
-    Берёт строку(и) image_prompt — всё после строки TEXT:.
-    """
+    """Парсит формат psych_prompt_pipeline: берёт строку(и) image_prompt после TEXT:."""
     items: List[PromptItem] = []
     i = 0
     while i < len(lines):
@@ -281,10 +278,8 @@ def parse_psych_pipeline_format(lines: List[str]) -> List[PromptItem]:
             continue
         index = int(m.group(1))
         i += 1
-        # Пропускаем строку TEXT:
         while i < len(lines) and lines[i].strip().upper().startswith("TEXT:"):
             i += 1
-        # Собираем строки промпта до следующего заголовка или пустой строки
         prompt_lines: List[str] = []
         while i < len(lines):
             cur = lines[i].strip()
@@ -367,7 +362,6 @@ def load_prompts(path: Path) -> List[PromptItem]:
     text = path.read_text(encoding="utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
     lines = text.splitlines()
 
-    # Пробуем форматы по убыванию специфичности
     items = parse_psych_pipeline_format(lines)
     if not items:
         items = parse_numbered_style(lines)
@@ -387,7 +381,6 @@ def find_prompts_file(lang: str) -> Optional[Path]:
         PROMPTS_DIR / lang / f"{ll}_{ll}_prompts.txt",
         PROMPTS_DIR / lang.upper() / f"prompts_{ll}.txt",
     ]
-    # Явно заданный путь
     explicit = PROMPTS_FILE_BY_LANG.get(lang.upper())
     if explicit:
         candidates.insert(0, explicit)
@@ -397,7 +390,6 @@ def find_prompts_file(lang: str) -> Optional[Path]:
         if rp.exists() and rp.stat().st_size > 0:
             return rp
 
-    # Рекурсивный поиск
     for p in PROMPTS_DIR.rglob(f"*prompts*{ll}*.txt"):
         if p.stat().st_size > 0:
             return p
@@ -409,12 +401,13 @@ def write_manifest(locale: str, items: Sequence[PromptItem]) -> None:
     locale_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = locale_dir / "manifest.csv"
     with manifest_path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["index", "filename", "prompt"])
+        writer = csv.DictWriter(f, fieldnames=["index", "filename", "operation", "prompt"])
         writer.writeheader()
         for item in items:
             writer.writerow({
                 "index": item.index,
                 "filename": f"{item.index:03d}.png",
+                "operation": current_operation(),
                 "prompt": item.prompt,
             })
 
@@ -422,16 +415,6 @@ def write_manifest(locale: str, items: Sequence[PromptItem]) -> None:
 # =========================
 # HTTP HELPERS
 # =========================
-
-def _check_api_json(data: dict, *, label: str) -> dict:
-    if not isinstance(data, dict):
-        raise RuntimeError(f"{label}: API вернул не JSON-объект")
-    # OperationResponse (submit) содержит success=true. OperationStatusResponse (poll)
-    # поля success не имеет — поэтому проверяем только явный success=false.
-    if data.get("success") is False:
-        raise RuntimeError(f"{label}: API success=false: {data.get('error') or pretty_json(data)}")
-    return data
-
 
 def should_retry(attempt: int) -> bool:
     return MAX_RETRIES <= 0 or attempt < MAX_RETRIES
@@ -448,7 +431,7 @@ def post_json(endpoint: str, payload: dict, *, label: str) -> dict:
                 raise FatalApiError(f"{label}: HTTP {resp.status_code}: {resp.text}")
             if resp.status_code >= 400:
                 raise RuntimeError(f"{label}: HTTP {resp.status_code}: {resp.text}")
-            return _check_api_json(resp.json(), label=label)
+            return resp.json()
         except (KeyboardInterrupt, FatalApiError):
             raise
         except Exception as e:
@@ -469,7 +452,7 @@ def get_json(endpoint: str, *, label: str, params: Optional[dict] = None) -> dic
                 raise FatalApiError(f"{label}: HTTP {resp.status_code}: {resp.text}")
             if resp.status_code >= 400:
                 raise RuntimeError(f"{label}: HTTP {resp.status_code}: {resp.text}")
-            return _check_api_json(resp.json(), label=label)
+            return resp.json()
         except (KeyboardInterrupt, FatalApiError):
             raise
         except Exception as e:
@@ -485,7 +468,7 @@ def download_file(url: str, path: Path, *, label: str, use_api_key: bool = False
     while True:
         attempt += 1
         try:
-            h = headers(json_content=False) if use_api_key else {}
+            h = {"X-API-Key": API_KEY} if use_api_key else {}
             resp = requests.get(url, headers=h, timeout=REQUEST_TIMEOUT)
             if resp.status_code in {400, 401, 403, 404}:
                 raise FatalApiError(f"{label}: HTTP {resp.status_code}")
@@ -505,7 +488,7 @@ def download_file(url: str, path: Path, *, label: str, use_api_key: bool = False
 
 
 # =========================
-# RESULT DECODING (data URI / file ref / url)
+# RESULT DECODING (V6: download_url | inline data)
 # =========================
 
 def split_data_uri(data_uri: str) -> Tuple[str, bytes]:
@@ -524,154 +507,122 @@ def save_data_uri(data_uri: str, path: Path) -> None:
         raise RuntimeError(f"Файл не сохранился: {path}")
 
 
-def resolve_file_ref(file_ref: str) -> str:
-    """Скачивает результат по file:<hash> из хранилища и возвращает его как data URI."""
-    fh = file_ref.replace("file:", "", 1)
-    url = STORAGE_GET_URL.format(file_hash=fh)
-    attempt = 0
-    while True:
-        attempt += 1
+def save_generation_results(results: Any, out_path: Path) -> None:
+    """
+    Сохраняет первый image-результат из GenerationStatusResponse.results.
+    V6 отдаёт либо download_url (готовый URL файла), либо inline data (data URI).
+    """
+    if not isinstance(results, list) or not results:
+        raise RuntimeError(f"Пустой results: {pretty_json(results)}")
+
+    # Берём первый элемент типа image (или просто первый).
+    item = next((r for r in results if isinstance(r, dict) and r.get("type") == "image"), None)
+    if item is None:
+        item = results[0] if isinstance(results[0], dict) else {}
+
+    data = item.get("data")
+    url = item.get("download_url")
+
+    if isinstance(data, str) and data.startswith("data:"):
+        save_data_uri(data, out_path)
+        return
+    if isinstance(url, str) and url:
+        # download_url обычно самодостаточен; если вернёт 401/403 — пробуем с API-ключом.
         try:
-            resp = requests.get(url, headers={"X-API-Key": API_KEY}, timeout=REQUEST_TIMEOUT)
-            if resp.status_code in {400, 401, 403, 404}:
-                raise FatalApiError(f"STORAGE GET: HTTP {resp.status_code}")
-            if resp.status_code >= 400:
-                raise RuntimeError(f"STORAGE GET: HTTP {resp.status_code}")
-            ct = (resp.headers.get("content-type") or "").lower()
-            text = resp.text.strip()
-            if text.startswith("data:"):
-                return text
-            if "application/json" in ct or text.startswith("{"):
-                data = resp.json()
-                for key in ["data_uri", "result", "file", "content"]:
-                    v = data.get(key)
-                    if isinstance(v, str) and v.startswith("data:"):
-                        return v
-            return "data:image/png;base64," + base64.b64encode(resp.content).decode()
-        except (KeyboardInterrupt, FatalApiError):
-            raise
-        except Exception as e:
-            if not should_retry(attempt):
-                raise
-            log(f"[WARN] storage get attempt {attempt} failed: {e}, retry in {RETRY_DELAY_SEC}s...")
-            time.sleep(RETRY_DELAY_SEC)
-
-
-def save_operation_result(result: Any, out_path: Path) -> None:
-    # OperationStatusResponse.result — это СПИСОК строк (media: data URI или file:ref).
-    if isinstance(result, list):
-        result = result[0] if result else None
-    if not isinstance(result, str):
-        raise RuntimeError(f"Неожиданный result: {pretty_json(result)}")
-    if result.startswith("data:"):
-        save_data_uri(result, out_path)
-    elif result.startswith("file:"):
-        save_data_uri(resolve_file_ref(result), out_path)
-    elif result.startswith("http"):
-        download_file(result, out_path, label="RESULT URL")
-    else:
-        raise RuntimeError(f"Неизвестный формат result: {result[:200]}")
+            download_file(url, out_path, label="RESULT URL")
+        except FatalApiError:
+            download_file(url, out_path, label="RESULT URL (auth)", use_api_key=True)
+        return
+    raise RuntimeError(f"В результате нет ни download_url, ни data: {pretty_json(item)}")
 
 
 # =========================
-# FLOWER / FLOW IMAGE API (text-to-image, без персонажа)
+# V6 IMAGE GENERATION (text-to-image, без персонажа)
 # =========================
 
-def build_api_prompt(scene_prompt: str, locale: str) -> str:
-    """
-    Промпт для чистой text-to-image генерации. Персонажа нет, поэтому промпт из
-    pipeline (эпичная живописная сцена + негативы) уходит в модель практически как есть.
-    Никаких инструкций «сохрани лицо/того же человека» больше не добавляем.
-    """
-    return clean_prompt_text(scene_prompt)
+def current_operation() -> str:
+    """Возвращает canonical V6 operation id: явный --operation или маппинг из --engine."""
+    if IMAGE_OPERATION:
+        return IMAGE_OPERATION
+    return ENGINE_TO_OPERATION.get(IMAGE_ENGINE, "flower_image_generate")
 
 
-def _resolve_aspect_ratio(engine: str) -> str:
-    """Подбирает корректный aspect_ratio под конкретный эндпоинт новой схемы."""
-    allowed = FLOW_ASPECT_RATIOS if engine == "flow" else FLOWER_ASPECT_RATIOS
-    if ASPECT_RATIO in allowed:
+def resolve_aspect_ratio() -> str:
+    if ASPECT_RATIO_RE.match(ASPECT_RATIO):
         return ASPECT_RATIO
-    fallback = "16:9" if "16:9" in allowed else sorted(allowed)[0]
-    log(f"[WARN] aspect_ratio {ASPECT_RATIO!r} недопустим для {engine} — использую {fallback!r}.")
-    return fallback
+    log(f"[WARN] aspect_ratio {ASPECT_RATIO!r} не в формате n:n — использую 16:9.")
+    return "16:9"
 
 
-def submit_generate(prompt: str, locale: str) -> Tuple[str, str]:
-    api_prompt = build_api_prompt(prompt, locale)
-
-    if IMAGE_ENGINE == "flow":
-        # flow text-to-image: модель на выбор, соблюдает aspect_ratio, seed для
-        # воспроизводимости конкретного кадра, опциональный апскейл x2.
-        payload: Dict[str, Any] = {
-            "prompt": api_prompt,
-            "aspect_ratio": _resolve_aspect_ratio("flow"),
-            "model": FLOW_MODEL,
-        }
-        if REFERENCE_SEED is not None:
-            payload["seed"] = min(max(0, REFERENCE_SEED), SEED_MAX)
-        if FLOW_UPSCALE_2X:
-            # generation_config.upscale.type="2x" — опция апскейла x2.
-            payload["generation_config"] = {"upscale": {"type": "2x"}}
-        data = post_json(FLOW_IMAGE_ENDPOINT, payload, label="FLOW IMAGE GENERATE")
-    else:
-        # flower text-to-image: 1 кредит, соблюдает aspect_ratio (референса нет).
-        payload = {
-            "prompt": api_prompt,
-            "aspect_ratio": _resolve_aspect_ratio("flower"),
-        }
-        data = post_json(FLOWER_IMAGE_ENDPOINT, payload, label="FLOWER IMAGE GENERATE")
-
-    op_id = data.get("operation_id")
-    if not op_id:
-        raise RuntimeError(f"API не вернул operation_id: {pretty_json(data)}")
-    op_type = str(data.get("operation_type") or "")
-    return str(op_id), op_type
+def build_payload(prompt: str) -> Dict[str, Any]:
+    """Тело запроса GenerationCreateRequest для text-to-image (без inputs/референсов)."""
+    op = current_operation()
+    payload: Dict[str, Any] = {
+        "prompt": clean_prompt_text(prompt),
+        "operation": op,
+        "aspect_ratio": resolve_aspect_ratio(),
+    }
+    if IMAGE_SEED is not None:
+        payload["seed"] = min(max(0, IMAGE_SEED), SEED_MAX)
+    if IMAGE_QUALITY:
+        payload["quality"] = IMAGE_QUALITY
+    if IMAGE_UPSCALE_2X and op in UPSCALE_CAPABLE:
+        payload["generation_config"] = {"upscale": {"type": "2x"}}
+    return payload
 
 
-def poll_operation(op_id: str) -> dict:
-    endpoint = V4_OPERATION_ENDPOINT.format(operation_id=op_id)
+def submit_generate(prompt: str) -> str:
+    """POST /api/v6/generations -> возвращает id генерации."""
+    data = post_json(V6_GENERATIONS_ENDPOINT, build_payload(prompt), label="V6 GENERATION CREATE")
+    gen_id = data.get("id")
+    if not gen_id:
+        raise RuntimeError(f"API не вернул id генерации: {pretty_json(data)}")
+    return str(gen_id)
+
+
+def poll_generation(gen_id: str) -> dict:
+    """GET /api/v6/generations/{id} до succeeded/failed."""
+    endpoint = V6_GENERATION_STATUS.format(generation_id=gen_id)
     started = time.time()
     while True:
-        # result_format=ref — получаем file:ref (стримим из хранилища), экономит трафик.
-        data = get_json(endpoint, label=f"V4 OP {op_id}", params={"result_format": "ref"})
+        data = get_json(endpoint, label=f"V6 GEN {gen_id}")
         state = data.get("status")
-        if state in {"pending", "processing"}:
-            log(f"    op {op_id}: {state}")
+        if state in {"queued", "running"}:
+            log(f"    gen {gen_id}: {state}")
             if time.time() - started > OPERATION_TIMEOUT_SEC:
-                raise RuntimeError(f"Timeout {op_id} after {OPERATION_TIMEOUT_SEC}s")
+                raise RuntimeError(f"Timeout {gen_id} after {OPERATION_TIMEOUT_SEC}s")
             time.sleep(OPERATION_POLL_SEC)
             continue
-        if state == "success":
-            if not data.get("result"):
-                raise RuntimeError(f"op {op_id}: success но result пустой")
+        if state == "succeeded":
+            if not data.get("results"):
+                raise RuntimeError(f"gen {gen_id}: succeeded, но results пустой")
             for w in (data.get("warnings") or []):
-                log(f"    [WARN] op {op_id}: {w}")
+                log(f"    [WARN] gen {gen_id}: {w}")
             return data
-        # state == "error" (или неизвестно): подтягиваем перевод ошибки, если есть.
+        # failed / неизвестно: подтягиваем перевод ошибки, если есть.
         err = data.get("error") or pretty_json(data)
         translations = data.get("translations") or {}
         if isinstance(translations, dict) and translations:
             tr = translations.get("ru") or next(iter(translations.values()), None)
             if tr:
                 err = f"{err} | {tr}"
-        raise RuntimeError(f"op {op_id}: {state}: {err}")
+        raise RuntimeError(f"gen {gen_id}: {state}: {err}")
 
 
 def generate_image(item: PromptItem, out_path: Path, locale: str) -> dict:
     attempt = 0
     while True:
         attempt += 1
-        op_id = None
+        gen_id = None
         try:
             log(f"[{locale}] {out_path.name} (#{item.index}) attempt {attempt}")
-            op_id, op_type = submit_generate(item.prompt, locale)
-            log(f"    op_id: {op_id}" + (f" ({op_type})" if op_type else ""))
-            op_data = poll_operation(op_id)
-            save_operation_result(op_data.get("result"), out_path)
+            gen_id = submit_generate(item.prompt)
+            log(f"    gen_id: {gen_id}")
+            gen_data = poll_generation(gen_id)
+            save_generation_results(gen_data.get("results"), out_path)
             log(f"    saved: {out_path}")
             return {"index": item.index, "locale": locale, "status": "success",
-                    "output": str(out_path), "op_id": op_id, "op_type": op_type,
-                    "attempts": attempt}
+                    "output": str(out_path), "gen_id": gen_id, "attempts": attempt}
         except (KeyboardInterrupt, FatalApiError):
             raise
         except Exception as e:
@@ -740,29 +691,29 @@ def process_locale(
 def main() -> None:
     global BASE_URL, SKIP_EXISTING, ASPECT_RATIO, MAX_IMAGE_WORKERS
     global OPERATION_POLL_SEC, PROMPTS_DIR, VISUAL_ROOT
-    global IMAGE_ENGINE, FLOW_MODEL, REFERENCE_SEED, FLOW_UPSCALE_2X
+    global IMAGE_ENGINE, IMAGE_OPERATION, IMAGE_QUALITY, IMAGE_SEED, IMAGE_UPSCALE_2X
 
     parser = argparse.ArgumentParser(
-        description="Генерирует DE/PL/RU картинки из текстовых промптов через Fast-Gen (flow/flower), без персонажа"
+        description="Генерирует DE/PL/RU картинки из текстовых промптов через Fast-Gen V6, без персонажа"
     )
     parser.add_argument("--lang", nargs="+", choices=LOCALES, default=None,
                         help="Языки для обработки. По умолчанию — все три.")
     parser.add_argument("--prompts-dir", default=str(PROMPTS_DIR),
                         help="Папка с файлами prompts_de.txt / prompts_pl.txt / prompts_ru.txt")
     parser.add_argument("--visual-root", default=str(VISUAL_ROOT), help="Папка ВИЗУАЛ")
-    parser.add_argument("--engine", choices=["flow", "flower"], default=IMAGE_ENGINE,
-                        help="flower = text-to-image (1 кредит). flow = text-to-image с выбором модели/seed/апскейла (4 кредита).")
-    parser.add_argument("--flow-model", default=FLOW_MODEL,
-                        choices=["NARWHAL", "GEM_PIX_2", "IMAGEN_3_5"],
-                        help="Модель для flow: NARWHAL=Nano Banana 2 (реком.), GEM_PIX_2=Nano Pro, IMAGEN_3_5=Imagen 4")
-    parser.add_argument("--seed", type=int, default=(REFERENCE_SEED if REFERENCE_SEED is not None else -1),
-                        help=f"Фиксированный seed для воспроизводимости кадра (flow), 0..{SEED_MAX}. -1 = случайный.")
-    parser.add_argument("--upscale", action="store_true", default=FLOW_UPSCALE_2X,
-                        help="flow: вернуть 2x-апскейл (generation_config.upscale.type=2x). Удваивает кредиты.")
+    parser.add_argument("--engine", choices=list(ENGINE_TO_OPERATION.keys()), default=IMAGE_ENGINE,
+                        help="Движок/операция: flower=1кр (дефолт), grok=1/3кр, openai=2кр, nano2/nano-pro=4/8кр.")
+    parser.add_argument("--operation", default=IMAGE_OPERATION or None,
+                        help="Напрямую canonical V6 operation id (перекрывает --engine), напр. flower_image_generate.")
+    parser.add_argument("--quality", default=(IMAGE_QUALITY or None), choices=["speed", "quality"],
+                        help="Режим качества для grok/openai.")
+    parser.add_argument("--seed", type=int, default=(IMAGE_SEED if IMAGE_SEED is not None else -1),
+                        help=f"Фиксированный seed для воспроизводимости кадра, 0..{SEED_MAX}. -1 = случайный.")
+    parser.add_argument("--upscale", action="store_true", default=IMAGE_UPSCALE_2X,
+                        help="2x-апскейл (только nano2/nano-pro). Удваивает кредиты.")
     parser.add_argument("--api-base", default=BASE_URL)
     parser.add_argument("--aspect-ratio", default=ASPECT_RATIO,
-                        choices=["16:9", "9:16", "1:1", "4:3", "3:4"],
-                        help="flow: 16:9/4:3/1:1/3:4/9:16; flower: 16:9/9:16/1:1.")
+                        help="Соотношение сторон в формате n:n (напр. 16:9, 9:16, 1:1, 4:3).")
     parser.add_argument("--workers", type=int, default=MAX_IMAGE_WORKERS,
                         help="Параллельных задач на язык (начни с 1-2, снизь при 429)")
     parser.add_argument("--poll-sec", type=int, default=OPERATION_POLL_SEC)
@@ -778,15 +729,15 @@ def main() -> None:
     OPERATION_POLL_SEC   = max(1, args.poll_sec)
     SKIP_EXISTING        = not args.no_skip
     IMAGE_ENGINE         = args.engine
-    FLOW_MODEL           = args.flow_model
-    REFERENCE_SEED       = min(args.seed, SEED_MAX) if args.seed is not None and args.seed >= 0 else None
-    FLOW_UPSCALE_2X      = bool(args.upscale)
+    IMAGE_OPERATION      = (args.operation or "").strip()
+    IMAGE_QUALITY        = (args.quality or "").strip()
+    IMAGE_SEED           = min(args.seed, SEED_MAX) if args.seed is not None and args.seed >= 0 else None
+    IMAGE_UPSCALE_2X     = bool(args.upscale)
 
     langs_to_process = args.lang or LOCALES
 
     ensure_dirs()
 
-    # Показываем план
     print("\n=== План работ ===")
     jobs: List[Tuple[str, List[PromptItem]]] = []
     for lang in langs_to_process:
@@ -808,30 +759,32 @@ def main() -> None:
         print(f"Ожидаемые файлы: prompts_de.txt / prompts_pl.txt / prompts_ru.txt в {PROMPTS_DIR}")
         sys.exit(1)
 
+    op = current_operation()
+    seed_txt = IMAGE_SEED if IMAGE_SEED is not None else "random"
+    extra = f", seed={seed_txt}"
+    if IMAGE_QUALITY:
+        extra += f", quality={IMAGE_QUALITY}"
+    if IMAGE_UPSCALE_2X and op in UPSCALE_CAPABLE:
+        extra += ", upscale=2x"
+
     if args.dry_run:
         log("\nDRY RUN — API не вызывается")
+        log(f"Operation: {op} | aspect_ratio={resolve_aspect_ratio()}{extra}")
         for lang, items in jobs:
             log(f"\n[{lang}] первые 3 промпта:")
             for item in items[:3]:
-                preview = build_api_prompt(item.prompt, lang)
-                log(f"  {item.index:03d}.png <- {preview[:160]}...")
+                log(f"  {item.index:03d}.png <- {clean_prompt_text(item.prompt)[:160]}...")
         return
 
     ensure_api_ready()
-    seed_txt = REFERENCE_SEED if REFERENCE_SEED is not None else "random"
-    extra = ""
-    if IMAGE_ENGINE == "flow":
-        extra = f" (model={FLOW_MODEL}, seed={seed_txt}" + (", upscale=2x" if FLOW_UPSCALE_2X else "") + ")"
-    log(f"Engine: {IMAGE_ENGINE}{extra} | text-to-image, без персонажа")
+    log(f"Operation: {op} | text-to-image, без персонажа | aspect_ratio={resolve_aspect_ratio()}{extra}")
 
     global_log = load_json(VISUAL_ROOT / "generation_log.json", [])
     if not isinstance(global_log, list):
         global_log = []
     log_lock = Lock()
 
-    # Генерируем каждый язык последовательно (параллелизм внутри языка)
     for lang, items in jobs:
-        # Пишем manifest
         write_manifest(lang, items)
         process_locale(lang, items, global_log, log_lock, MAX_IMAGE_WORKERS)
 
