@@ -70,7 +70,9 @@ DEFAULT_PROMPTS_FOLDER   = "/Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ
 OPENAI_API_KEY = ""
 
 TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-1")
-PROMPT_MODEL     = os.getenv("PROMPT_MODEL", "gpt-5.4")
+# Дешёвый/быстрый tier по умолчанию. Сцены — это короткий структурированный JSON,
+# тяжёлая модель тут не нужна. Переопределить: export PROMPT_MODEL=gpt-5.4
+PROMPT_MODEL     = os.getenv("PROMPT_MODEL", "gpt-5-mini")
 
 LANGUAGE_ORDER = ["ru", "pl", "de"]
 LANGUAGES: dict[str, dict[str, Any]] = {
@@ -857,7 +859,7 @@ def generate_prompts(
     client: OpenAI,
     blocks: list[VisualBlock],
     lang_code: str,
-    batch_size: int = 16,
+    batch_size: int = 24,
     workers: int = DEFAULT_PROMPT_WORKERS,
 ) -> list[PromptRow]:
     lang_name = LANGUAGES.get(lang_code, {}).get("name", lang_code.upper())
