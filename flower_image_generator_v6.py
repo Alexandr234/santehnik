@@ -1,44 +1,41 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DE/PL/RU IMAGE generator — Fast-Gen V6, С ПЕРСОНАЖЕМ (flower_image_edit), максимум потоков.
+DE/PL/RU IMAGE generator — Fast-Gen V6, ЧИСТО ПО ТЕКСТУ (без персонажа/референса), максимум потоков.
 
-Итог долгого разбора:
-  • На сервере остался только V6 API (/api/v6/generations). V4 отдаёт 404.
-  • Модель flower умеет только РЕДАКТИРОВАТЬ картинку:
-      - flower_image_generate (из текста, без входной картинки) -> "Generation failed".
-      - flower_image_edit    (с входной картинкой в inputs)     -> РАБОТАЕТ, 1 кредит.
-  • Поэтому генерим как рабочий старый скрипт: даём flower твоего персонажа
-    (МОЙ ПЕРСОНАЖ.png) в inputs, а промпт описывает сцену, куда его поместить.
+Важно про модели (по OpenAPI V6, api1_11):
+  • flower НЕ генерит из текста — это модель РЕДАКТИРОВАНИЯ картинки
+    (flower_image_generate из текста => "Generation failed"). Поэтому flower тут НЕ используется.
+  • Из текста умеют:
+      grok_image_generate            — grok/grok-image, 1 кредит (speed)
+      openai_image_generate          — openai/openai-image, 2 кредита
+      nano_banana_2_image_generate   — flow/nano-banana-2, 4 кредита
+      nano_banana_pro_image_generate — flow/nano-banana-pro, 4 кредита
 
-Строго по OpenAPI V6 (api1_11):
-  • POST /api/v6/generations       (GenerationCreateRequest: operation, prompt, inputs[], aspect_ratio, seed, generation_config)
-      inputs — массив data URI ("data:<mime>;base64,...") или 32-символьных storage id.
-  • GET  /api/v6/generations/{id}  (GenerationStatusResponse: status queued|running|succeeded|failed, results[])
-      results[i]: {type, download_url, data, mime_type, metadata}.
+Чтобы не гадать, какая модель жива на аккаунте, скрипт при старте делает по 1 пробной
+генерации (автоподбор) и дальше гонит всё на первой рабочей. Можно жёстко задать --operation.
 
-Скорость: все языки (DE/PL/RU) в ОДНОМ общем пуле потоков; число потоков берётся из
-лимита аккаунта (GET /api/v6/usage -> img_generation_threads_allowed).
+Строго по V6:
+  • POST /api/v6/generations       (operation, prompt, aspect_ratio, seed, quality, generation_config)
+  • GET  /api/v6/generations/{id}  (status queued|running|succeeded|failed, results[])
+      results[i]: {type, download_url, data, mime_type}
 
-Движки:
-  • flower (по умолчанию) -> operation=flower_image_edit, 1 кредит, 1 референс.
-  • flow                  -> operation=nano_banana_2_image_generate | nano_banana_pro_image_generate,
-                             4 кредита, до нескольких референсов, поддерживает seed и 2x upscale.
+Скорость: все языки (DE/PL/RU) в одном общем пуле потоков; число потоков из лимита
+аккаунта (GET /api/v6/usage -> img_generation_threads_allowed).
 
 Быстрый запуск:
   python3 flower_image_generator_v6.py
 
 Флаги:
-  --workers auto|max|N     потоки. auto = лимит аккаунта − запас (по умолчанию).
+  --operation grok_image_generate|openai_image_generate|nano_banana_2_image_generate|nano_banana_pro_image_generate
+              жёстко выбрать модель (по умолчанию — автоподбор рабочей)
+  --workers auto|max|N     потоки. auto = лимит аккаунта − запас (по умолчанию)
   --lang DE PL RU          только нужные языки
-  --engine flower|flow
-  --flow-model nano2|nanopro   модель для --engine flow
-  --character-image ...    один или несколько файлов персонажа (референсы)
-  --reference-name Alex    латинское имя персонажа
-  --seed N                 фиксированный seed (flow), -1 = случайный
-  --upscale                flow: 2x-апскейл (удваивает кредиты)
+  --quality speed|quality  для grok
+  --seed N                 фикс. seed (nano/openai), -1 = случайный
+  --upscale                nano_banana_*: 2x-апскейл (удваивает кредиты)
   --aspect-ratio 16:9|9:16|1:1|4:3|3:4
-  --no-skip                перегенерировать уже существующие
+  --no-skip                перегенерировать существующие
   --dry-run                показать промпты, API не вызывать
 """
 
@@ -88,25 +85,22 @@ PROMPTS_FILE_BY_LANG: Dict[str, Path] = {
     "RU": PROMPTS_DIR / "prompts_ru.txt",
 }
 
-CHARACTER_IMAGE_PATH = PROJECT_ROOT / "ВИЗУАЛ" / "МОЙ ПЕРСОНАЖ.png"
-REFERENCE_NAME = os.getenv("FLOWER_REFERENCE_NAME", "Alex").strip() or "Alex"
-
 LOCALES = ["DE", "PL", "RU"]
 
-# --- V6 endpoints ---
 V6_GENERATIONS_ENDPOINT = "/api/v6/generations"
 V6_GENERATION_STATUS_ENDPOINT = "/api/v6/generations/{generation_id}"
 V6_USAGE_ENDPOINT = "/api/v6/usage"
 
-# Операции V6 для картинок с входным изображением (edit):
-FLOWER_EDIT_OP = "flower_image_edit"                 # 1 кредит, 1 референс
-FLOW_OPS = {                                          # 4 кредита, несколько референсов
-    "nano2": "nano_banana_2_image_generate",
-    "nanopro": "nano_banana_pro_image_generate",
-}
+# Модели, умеющие text-to-image. flower исключён (он только edit).
+TEXT2IMAGE_OPERATIONS = [
+    "grok_image_generate",            # 1 кредит (speed)
+    "openai_image_generate",          # 2 кредита
+    "nano_banana_2_image_generate",   # 4 кредита
+    "nano_banana_pro_image_generate", # 4 кредита
+]
 
-IMAGE_ENGINE = os.getenv("FAST_GEN_IMAGE_ENGINE", "flower").strip().lower() or "flower"
-FLOW_MODEL = os.getenv("FAST_GEN_FLOW_MODEL", "nano2").strip().lower() or "nano2"
+# Текущая рабочая операция (выбирается автоподбором или флагом --operation).
+V6_OPERATION = os.getenv("FAST_GEN_IMAGE_OPERATION", "").strip()
 
 ASPECT_RATIO = os.getenv("FAST_GEN_IMAGE_ASPECT_RATIO", "16:9")
 ASPECT_RATIO_RE = re.compile(r"^[1-9]\d*:[1-9]\d*$")
@@ -134,12 +128,9 @@ _WORKERS_RAW = os.getenv("FAST_GEN_IMAGE_WORKERS", "").strip()
 MAX_IMAGE_WORKERS: str | int = int(_WORKERS_RAW) if _WORKERS_RAW.isdigit() and int(_WORKERS_RAW) > 0 else "auto"
 CONCURRENCY_MARGIN = int(os.getenv("FAST_GEN_CONCURRENCY_MARGIN", "2"))
 WORKERS_HARD_CAP = int(os.getenv("FAST_GEN_WORKERS_HARD_CAP", "64"))
-WORKERS_FALLBACK = int(os.getenv("FAST_GEN_WORKERS_FALLBACK", "20"))
+WORKERS_FALLBACK = int(os.getenv("FAST_GEN_WORKERS_FALLBACK", "6"))
 
 GEN_FAIL_MAX_RETRIES = int(os.getenv("FAST_GEN_GEN_FAIL_MAX_RETRIES", "6"))
-
-# Инлайновый лимит V6 на картинку-вход — 5 MB. Держим референс ниже.
-REFERENCE_MAX_BYTES = int(os.getenv("FAST_GEN_REFERENCE_MAX_BYTES", str(4_500_000)))
 
 SKIP_EXISTING = True
 STOP_EVENT = Event()
@@ -184,12 +175,6 @@ def headers(json_content: bool = True) -> Dict[str, str]:
 def ensure_api_ready() -> None:
     if not API_KEY:
         print("[ERROR] Не найден API ключ Fast-Gen.", file=sys.stderr)
-        sys.exit(1)
-
-
-def ensure_reference_name_ready(name: str) -> None:
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,40}", name):
-        print(f"[ERROR] REFERENCE_NAME должен быть латиницей: {name!r}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -402,14 +387,13 @@ def write_manifest(locale: str, items: Sequence[PromptItem]) -> None:
     locale_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = locale_dir / "manifest.csv"
     with manifest_path.open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["index", "filename", "engine", "reference_name", "prompt"])
+        writer = csv.DictWriter(f, fieldnames=["index", "filename", "operation", "prompt"])
         writer.writeheader()
         for item in items:
             writer.writerow({
                 "index": item.index,
                 "filename": f"{item.index:03d}.png",
-                "engine": IMAGE_ENGINE,
-                "reference_name": REFERENCE_NAME,
+                "operation": V6_OPERATION,
                 "prompt": item.prompt,
             })
 
@@ -458,8 +442,6 @@ def _safe_payload_for_log(payload: dict) -> dict:
     safe = dict(payload)
     if isinstance(safe.get("prompt"), str) and len(safe["prompt"]) > 200:
         safe["prompt"] = safe["prompt"][:200] + "...[truncated]"
-    if "inputs" in safe:
-        safe["inputs"] = [f"<{len(str(x))} bytes input>" for x in safe["inputs"]]
     return safe
 
 
@@ -595,17 +577,8 @@ def resolve_workers(requested: str | int) -> int:
 
 
 # =========================
-# DATA URI / REFERENCE
+# RESULT DECODING
 # =========================
-
-def guess_mime(path: Path) -> str:
-    s = path.suffix.lower()
-    return {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(s, "image/jpeg")
-
-
-def to_data_uri(path: Path) -> str:
-    return f"data:{guess_mime(path)};base64," + base64.b64encode(path.read_bytes()).decode()
-
 
 def split_data_uri(data_uri: str) -> Tuple[str, bytes]:
     if not data_uri.startswith("data:") or "," not in data_uri:
@@ -622,62 +595,6 @@ def save_data_uri(data_uri: str, path: Path) -> None:
     if not file_ok(path):
         raise RuntimeError(f"Файл не сохранился: {path}")
 
-
-def prepare_reference_file(src: Path) -> Path:
-    """Гарантирует размер <= 5 MB (лимит инлайнового input V6). При превышении — ужимает Pillow."""
-    size = src.stat().st_size
-    if size <= REFERENCE_MAX_BYTES:
-        return src
-    log(f"[WARN] Референс {size / 1024 / 1024:.2f} MB > лимита 5 MB — ужимаю.")
-    try:
-        from PIL import Image  # type: ignore
-    except Exception:
-        log("[ERROR] Pillow не установлен (pip install pillow) — не могу ужать референс, API может отклонить >5MB.")
-        return src
-    img = Image.open(src)
-    rgb = img.convert("RGB")
-    out = src.with_name(f".{src.stem}_ref_resized.jpg")
-    max_side = max(rgb.size)
-    quality = 92
-    while True:
-        work = rgb
-        if max_side > 1536:
-            scale = 1536 / max_side
-            work = rgb.resize((int(rgb.width * scale), int(rgb.height * scale)), Image.LANCZOS)
-        work.save(out, format="JPEG", quality=quality, optimize=True)
-        if out.stat().st_size <= REFERENCE_MAX_BYTES or quality <= 60:
-            break
-        quality -= 8
-        max_side = int(max_side * 0.9)
-    log(f"    ужал референс -> {out.name} ({out.stat().st_size / 1024 / 1024:.2f} MB, q={quality})")
-    return out
-
-
-def load_reference_inputs(image_paths: Sequence[Path]) -> dict:
-    """Кодирует референсы в data URI для поля inputs V6."""
-    inputs: List[str] = []
-    paths: List[str] = []
-    for p in image_paths:
-        resolved = resolve_existing_path(Path(p))
-        if not resolved.exists():
-            raise FileNotFoundError(
-                f"Не найден файл персонажа:\n  {p}\n"
-                "Проверь имя. На macOS буква Й бывает в разной Unicode-форме."
-            )
-        resolved = prepare_reference_file(resolved)
-        inputs.append(to_data_uri(resolved))
-        paths.append(str(resolved))
-    max_refs = 1 if IMAGE_ENGINE == "flower" else 10
-    if len(inputs) > max_refs:
-        log(f"[WARN] {IMAGE_ENGINE}: беру первые {max_refs} референсов из {len(inputs)}.")
-        inputs = inputs[:max_refs]
-        paths = paths[:max_refs]
-    return {"name": REFERENCE_NAME, "inputs": inputs, "paths": paths}
-
-
-# =========================
-# RESULT DECODING — GenerationStatusResponse.results
-# =========================
 
 def save_v6_results(results: Any, out_path: Path) -> None:
     if not isinstance(results, list) or not results:
@@ -706,7 +623,7 @@ def save_v6_results(results: Any, out_path: Path) -> None:
 
 
 # =========================
-# V6 GENERATION (edit с референсом)
+# V6 TEXT-TO-IMAGE
 # =========================
 
 def _resolve_aspect_ratio() -> str:
@@ -716,54 +633,26 @@ def _resolve_aspect_ratio() -> str:
     return "16:9"
 
 
-def build_api_prompt(scene_prompt: str, reference_name: str) -> str:
-    """Промпт для edit: зафиксировать персонажа с референса, менять только сцену."""
-    scene = re.sub(r"\bthis character\b", reference_name, scene_prompt, flags=re.IGNORECASE)
-    scene = re.sub(r"\bthe character\b", reference_name, scene, flags=re.IGNORECASE)
-    return (
-        "TASK: keep one fixed recurring character identical across images. "
-        f"The attached reference image(s) define the EXACT appearance of {reference_name}. "
-        f"Keep {reference_name} 100% identical to the reference: the same face and facial "
-        "features, face shape, skin tone, eye color, eyebrows, nose, lips, the same hair "
-        "color and hairstyle, the same age and body type. Treat the face as locked — do NOT "
-        "redraw, beautify, age, de-age, change ethnicity, swap gender, or generate a "
-        "different-looking person. It must clearly be the very same individual. "
-        f"{reference_name} is the only person in the image — no extra people, no crowd. "
-        "Only change the pose, action, clothing if the scene asks, the lighting and the "
-        "environment around the person to fit the scene below. Sharp focus, no text, no "
-        "subtitles, no watermark, no logo. "
-        f"Scene to place {reference_name} into: {scene}"
-    )
+def build_payload(prompt: str, operation: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "operation": operation,
+        "prompt": clean_prompt_text(prompt),
+        "aspect_ratio": _resolve_aspect_ratio(),
+    }
+    if operation == "grok_image_generate":
+        q = os.getenv("FAST_GEN_IMAGE_QUALITY", "speed").strip().lower() or "speed"
+        if q in {"speed", "quality"}:
+            payload["quality"] = q
+    if IMAGE_SEED is not None and operation != "grok_image_generate":
+        payload["seed"] = min(max(0, IMAGE_SEED), SEED_MAX)
+    if operation in {"nano_banana_2_image_generate", "nano_banana_pro_image_generate"} and FLOW_UPSCALE_2X:
+        payload["generation_config"] = {"upscale": {"type": "2x"}}
+    return payload
 
 
-def build_payload(prompt: str, ref: dict) -> Tuple[Dict[str, Any], str]:
-    api_prompt = build_api_prompt(prompt, ref["name"])
-    if IMAGE_ENGINE == "flow":
-        operation = FLOW_OPS.get(FLOW_MODEL, FLOW_OPS["nano2"])
-        payload: Dict[str, Any] = {
-            "operation": operation,
-            "prompt": api_prompt,
-            "inputs": ref["inputs"],
-            "aspect_ratio": _resolve_aspect_ratio(),
-        }
-        if IMAGE_SEED is not None:
-            payload["seed"] = min(max(0, IMAGE_SEED), SEED_MAX)
-        if FLOW_UPSCALE_2X:
-            payload["generation_config"] = {"upscale": {"type": "2x"}}
-    else:
-        operation = FLOWER_EDIT_OP
-        payload = {
-            "operation": operation,
-            "prompt": api_prompt,
-            "inputs": ref["inputs"][:1],
-            "aspect_ratio": _resolve_aspect_ratio(),
-        }
-    return payload, f"V6 {operation}"
-
-
-def submit_generate(prompt: str, ref: dict) -> Tuple[str, str]:
-    payload, label = build_payload(prompt, ref)
-    data = post_json(V6_GENERATIONS_ENDPOINT, payload, label=label)
+def submit_generate(prompt: str) -> Tuple[str, str]:
+    payload = build_payload(prompt, V6_OPERATION)
+    data = post_json(V6_GENERATIONS_ENDPOINT, payload, label=f"V6 {V6_OPERATION}")
     generation_id = data.get("id")
     if not generation_id:
         raise RuntimeError(f"API не вернул id генерации: {pretty_json(data)}")
@@ -797,7 +686,7 @@ def poll_operation(generation_id: str) -> dict:
         raise RuntimeError(f"gen {generation_id}: {state}: {err}")
 
 
-def generate_image(job: Job, ref: dict) -> dict:
+def generate_image(job: Job) -> dict:
     item, out_path, locale = job.item, job.out_path, job.locale
     attempt = 0
     while True:
@@ -806,7 +695,7 @@ def generate_image(job: Job, ref: dict) -> dict:
         attempt += 1
         try:
             log(f"[{locale}] {out_path.name} (#{item.index}) attempt {attempt}")
-            generation_id, operation = submit_generate(item.prompt, ref)
+            generation_id, operation = submit_generate(item.prompt)
             log(f"    generation_id: {generation_id}" + (f" ({operation})" if operation else ""))
             op_data = poll_operation(generation_id)
             save_v6_results(op_data.get("results"), out_path)
@@ -828,6 +717,64 @@ def generate_image(job: Job, ref: dict) -> dict:
 
 
 # =========================
+# АВТОПОДБОР РАБОЧЕЙ МОДЕЛИ
+# =========================
+
+def probe_operation(operation: str, prompt: str, *, timeout: int = 120) -> Tuple[bool, str]:
+    """Одна генерация через operation, без бесконечных ретраев. (ok, detail)."""
+    url = BASE_URL.rstrip("/") + V6_GENERATIONS_ENDPOINT
+    payload = build_payload(prompt, operation)
+    try:
+        r = requests.post(url, headers=headers(), json=payload, timeout=REQUEST_TIMEOUT)
+    except Exception as e:
+        return False, f"POST error: {e}"
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}: {r.text[:160]}"
+    try:
+        gid = r.json().get("id")
+    except Exception:
+        gid = None
+    if not gid:
+        return False, f"нет id: {r.text[:160]}"
+    status_url = BASE_URL.rstrip("/") + V6_GENERATION_STATUS_ENDPOINT.format(generation_id=gid)
+    started = time.time()
+    while time.time() - started < timeout:
+        time.sleep(3)
+        try:
+            s = requests.get(status_url, headers=headers(json_content=False), timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            return False, f"GET error: {e}"
+        if s.status_code == 429:
+            continue
+        if s.status_code != 200:
+            return False, f"status HTTP {s.status_code}: {s.text[:160]}"
+        body = s.json()
+        st = body.get("status")
+        if st == "succeeded":
+            return True, f"ok, results={len(body.get('results') or [])}"
+        if st == "failed":
+            return False, f"failed: {body.get('error') or body}"
+    return False, f"timeout {timeout}s"
+
+
+def autoselect_operation(sample_prompt: str) -> Optional[str]:
+    log("\n" + "=" * 50)
+    log("АВТОПОДБОР рабочей модели (по 1 пробной картинке)")
+    log("=" * 50)
+    for op in TEXT2IMAGE_OPERATIONS:
+        log(f"-> проверяю {op} ...")
+        ok, detail = probe_operation(op, sample_prompt)
+        log(f"   {'✅ OK' if ok else '❌'} {op}: {detail}")
+        if ok:
+            log(f"\n[ВЫБРАНА МОДЕЛЬ] {op}")
+            log("=" * 50)
+            return op
+    log("\n❌ Ни одна text-to-image модель не сработала — проблема на стороне аккаунта/сервиса.")
+    log("=" * 50)
+    return None
+
+
+# =========================
 # GLOBAL SCHEDULING
 # =========================
 
@@ -846,7 +793,7 @@ def build_jobs(jobs_by_lang: List[Tuple[str, List[PromptItem]]]) -> List[Job]:
     return jobs
 
 
-def run_all(jobs: List[Job], ref: dict, workers: int, global_log: List[dict], log_lock: Lock) -> None:
+def run_all(jobs: List[Job], workers: int, global_log: List[dict], log_lock: Lock) -> None:
     if not jobs:
         log("  [OK] все картинки уже существуют")
         return
@@ -856,7 +803,7 @@ def run_all(jobs: List[Job], ref: dict, workers: int, global_log: List[dict], lo
     log(f"{'=' * 42}")
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(generate_image, job, ref): job for job in jobs}
+        futures = {ex.submit(generate_image, job): job for job in jobs}
         try:
             for future in as_completed(futures):
                 job = futures[future]
@@ -904,28 +851,26 @@ def _parse_workers_arg(value: str) -> str | int:
 
 
 def main() -> None:
-    global BASE_URL, REFERENCE_NAME, SKIP_EXISTING, ASPECT_RATIO, MAX_IMAGE_WORKERS
-    global OPERATION_POLL_SEC, CHARACTER_IMAGE_PATH, PROMPTS_DIR, VISUAL_ROOT
-    global IMAGE_ENGINE, FLOW_MODEL, IMAGE_SEED, FLOW_UPSCALE_2X
+    global BASE_URL, SKIP_EXISTING, ASPECT_RATIO, MAX_IMAGE_WORKERS
+    global OPERATION_POLL_SEC, PROMPTS_DIR, VISUAL_ROOT
+    global V6_OPERATION, IMAGE_SEED, FLOW_UPSCALE_2X
 
     parser = argparse.ArgumentParser(
-        description="Генерирует DE/PL/RU картинки с персонажем через Fast-Gen V6 (flower_image_edit / nano_banana), "
-                    "один общий пул потоков на максимальной скорости."
+        description="Генерирует DE/PL/RU картинки ИЗ ТЕКСТА через Fast-Gen V6, без персонажа, "
+                    "один общий пул потоков; при старте автоподбор рабочей модели."
     )
     parser.add_argument("--lang", nargs="+", choices=LOCALES, default=None)
     parser.add_argument("--prompts-dir", default=str(PROMPTS_DIR))
     parser.add_argument("--visual-root", default=str(VISUAL_ROOT))
-    parser.add_argument("--character-image", nargs="+", default=[str(CHARACTER_IMAGE_PATH)],
-                        help="Один или несколько файлов персонажа (референсы).")
-    parser.add_argument("--reference-name", default=REFERENCE_NAME, help="Латинское имя персонажа, напр. Alex")
-    parser.add_argument("--engine", choices=["flower", "flow"], default=IMAGE_ENGINE,
-                        help="flower = flower_image_edit (1 кредит). flow = nano_banana (4 кредита).")
-    parser.add_argument("--flow-model", choices=["nano2", "nanopro"], default=FLOW_MODEL,
-                        help="Модель для --engine flow: nano2=Nano Banana 2, nanopro=Nano Banana Pro.")
+    parser.add_argument("--operation", choices=TEXT2IMAGE_OPERATIONS, default=(V6_OPERATION or None),
+                        help="Жёстко выбрать модель. По умолчанию — автоподбор рабочей.")
     parser.add_argument("--seed", type=int, default=(IMAGE_SEED if IMAGE_SEED is not None else -1),
-                        help=f"seed для flow, 0..{SEED_MAX}. -1 = случайный.")
+                        help=f"seed (nano/openai), 0..{SEED_MAX}. -1 = случайный.")
+    parser.add_argument("--quality", choices=["speed", "quality"],
+                        default=os.getenv("FAST_GEN_IMAGE_QUALITY", "").strip().lower() or None,
+                        help="Качество для grok.")
     parser.add_argument("--upscale", action="store_true", default=FLOW_UPSCALE_2X,
-                        help="flow: 2x upscale. Удваивает кредиты.")
+                        help="2x upscale для nano_banana_*. Удваивает кредиты.")
     parser.add_argument("--api-base", default=BASE_URL)
     parser.add_argument("--aspect-ratio", default=ASPECT_RATIO,
                         choices=["16:9", "9:16", "1:1", "4:3", "3:4"])
@@ -939,21 +884,18 @@ def main() -> None:
     BASE_URL = args.api_base.rstrip("/")
     PROMPTS_DIR = Path(args.prompts_dir).expanduser()
     VISUAL_ROOT = Path(args.visual_root).expanduser()
-    CHARACTER_IMAGE_PATHS = [Path(p).expanduser() for p in args.character_image]
-    CHARACTER_IMAGE_PATH = CHARACTER_IMAGE_PATHS[0]
-    REFERENCE_NAME = (args.reference_name or "Alex").strip() or "Alex"
     ASPECT_RATIO = args.aspect_ratio
     MAX_IMAGE_WORKERS = args.workers
     OPERATION_POLL_SEC = max(1, args.poll_sec)
     SKIP_EXISTING = not args.no_skip
-    IMAGE_ENGINE = args.engine
-    FLOW_MODEL = args.flow_model
+    V6_OPERATION = args.operation or ""
     IMAGE_SEED = min(args.seed, SEED_MAX) if args.seed is not None and args.seed >= 0 else None
     FLOW_UPSCALE_2X = bool(args.upscale)
+    if args.quality:
+        os.environ["FAST_GEN_IMAGE_QUALITY"] = args.quality
 
     langs_to_process = args.lang or LOCALES
 
-    ensure_reference_name_ready(REFERENCE_NAME)
     ensure_dirs()
 
     print("\n=== План работ ===")
@@ -976,26 +918,29 @@ def main() -> None:
         print(f"Ожидаемые файлы: prompts_de.txt / prompts_pl.txt / prompts_ru.txt в {PROMPTS_DIR}", file=sys.stderr)
         sys.exit(1)
 
-    extra = f"engine={IMAGE_ENGINE}"
-    if IMAGE_ENGINE == "flow":
-        seed_txt = IMAGE_SEED if IMAGE_SEED is not None else "random"
-        extra += f", model={FLOW_MODEL}, seed={seed_txt}" + (", upscale=2x" if FLOW_UPSCALE_2X else "")
-
     if args.dry_run:
         log("\nDRY RUN — API не вызывается")
-        log(f"Fast-Gen V6 | {extra} | с персонажем | aspect_ratio={_resolve_aspect_ratio()}")
+        log(f"Fast-Gen V6 | text-to-image, без персонажа | aspect_ratio={_resolve_aspect_ratio()}")
         for lang, items in jobs_by_lang:
             log(f"\n[{lang}] первые 3 промпта:")
             for item in items[:3]:
-                log(f"  {item.index:03d}.png <- {build_api_prompt(item.prompt, REFERENCE_NAME)[:160]}...")
+                log(f"  {item.index:03d}.png <- {clean_prompt_text(item.prompt)[:160]}...")
         return
 
     ensure_api_ready()
-    ref = load_reference_inputs(CHARACTER_IMAGE_PATHS)
-    log(f"Fast-Gen V6 | {extra} | с персонажем | aspect_ratio={_resolve_aspect_ratio()}")
-    log(f"Reference: {len(ref['inputs'])} шт.")
-    for p in ref["paths"]:
-        log(f"  - {p}")
+
+    sample_prompt = next((it.prompt for _, items in jobs_by_lang for it in items), "a calm minimalist illustration")
+    if not V6_OPERATION:
+        chosen = autoselect_operation(sample_prompt)
+        if not chosen:
+            print("\n❌ Рабочая text-to-image модель не найдена. Проверь баланс кредитов и статус Fast-Gen.",
+                  file=sys.stderr)
+            sys.exit(2)
+        V6_OPERATION = chosen
+    else:
+        log(f"[МОДЕЛЬ] задана вручную: {V6_OPERATION}")
+
+    log(f"Fast-Gen V6 | operation={V6_OPERATION} | text-to-image, без персонажа | aspect_ratio={_resolve_aspect_ratio()}")
 
     workers = resolve_workers(MAX_IMAGE_WORKERS)
 
@@ -1010,7 +955,7 @@ def main() -> None:
     log_lock = Lock()
 
     try:
-        run_all(jobs, ref, workers, global_log, log_lock)
+        run_all(jobs, workers, global_log, log_lock)
     except FatalApiError as e:
         print("\n" + "=" * 42, file=sys.stderr)
         print("FATAL API ERROR — запуск остановлен", file=sys.stderr)
