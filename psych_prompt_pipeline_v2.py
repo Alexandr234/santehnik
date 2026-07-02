@@ -3,38 +3,37 @@
 """
 Pipeline: RU / PL / DE voiceovers -> Whisper transcription -> visual blocks with timecodes -> image prompts.
 
-v2.1 (удешевление и ускорение генерации промптов):
+v3.1 (удешевление и ускорение генерации промптов):
   * Модель по умолчанию — gpt-4o-mini (была дорогая gpt-5.4). Переопределяется env PROMPT_MODEL.
   * Системный и пользовательский промпты сжаты — заметно меньше входных токенов на каждый вызов.
   * Больше блоков в одном запросе (batch 24 вместо 16): меньше вызовов API -> дешевле и быстрее.
     Настраивается env PROMPT_BATCH_SIZE или флагом --prompt-batch-size.
 
-v2 changes (по сравнению с gpt54):
-  * Стиль рисунка (ART_STYLE) больше НЕ привязывает персонажа к одной пустой комнате —
-    локация теперь свободная и разная от сцены к сцене.
-  * Добавлена тема ролика VIDEO_THEME (env VIDEO_THEME или флаг --theme), которая
-    подаётся модели, чтобы сцены были ПО ТЕМЕ конкретного видео.
-  * Банки сцен/локаций/действий/символов сделаны общими и бытовыми (двор, улица,
-    салон авто, дорога, магазин, комната), а не «травма + цепи + маски».
-  * normalize_scene ДОВЕРЯЕТ модели: environment/action/symbol берутся как есть,
-    банк используется только если поле пустое. Жёсткой случайной подмены больше нет —
-    именно она раньше делала картинки нерелевантными тексту.
-  * Озвучки читаются из папки ОЗВУЧКА (куда их кладёт voicer_batch_tts_RU_PL_DE.py).
+v3 changes (по сравнению с v2):
+  * УБРАНА привязка к постоянному персонажу. Раньше в каждом кадре был один и тот же
+    "парень в оливковом худи". Теперь героя-константы НЕТ: если в кадре есть человек,
+    это БЕЗЛИКАЯ анонимная фигура (силуэт со спины, без узнаваемого лица), маленькая
+    в масштабе огромной сцены. Часто человека может не быть вовсе — только пейзаж/символ.
+  * Полностью изменён СТИЛЬ (ART_STYLE): вместо плоского минималистичного мультика —
+    эпичная живописная digital-oil / concept-art картина: густые мазки, драматический
+    кинематографический свет, палитра золото + глубокий багрово-красный, лучи света,
+    космический масштаб, сюрреалистичная символика, атмосфера благоговения (the sublime).
+    (Стиль взят с референс-кадров: одинокий силуэт на краю обрыва перед сияющим морем,
+    столпы золотого света, монолиты, космический гигант из туманностей и т.п.)
+  * normalize_scene / промпты больше НЕ требуют "the main character" и не описывают
+    одежду/волосы. Фигура анонимна и опциональна.
 
-Стиль остаётся: FLAT 2D HAND-DRAWN MINIMALIST CARTOON (простой "webcomic / explainer")
-с ОДНИМ постоянным героем:
+Тема ролика по-прежнему задаётся через VIDEO_THEME (env VIDEO_THEME или флаг --theme),
+чтобы сцены были ПО ТЕМЕ конкретного видео.
 
-    Молодой парень с короткими растрёпанными каштановыми волосами и минималистичным
-    лицом-точками, в оливково-зелёном худи и таких же зелёных штанах.
-
-Герой описан в ОДНОМ месте (MAIN_CHARACTER). Меняй там, либо через env MAIN_CHARACTER_DESC,
-либо флагом --character.
-
-Все остальные люди в кадре — простые БЕЛЫЕ безликие фигуры (другие люди / общество),
-контрастирующие с цветным героем.
+Стиль (кратко):
+    EPIC PAINTERLY DIGITAL OIL / CONCEPT-ART. Одинокая безликая фигура (или толпа
+    силуэтов) в огромном, залитом золотым и багровым светом мире. Густые мазки,
+    драматический свет, сюрреалистичный символизм, ощущение благоговения.
 
 Default folders:
     Voiceovers:  /Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/ОЗВУЧКА
+                 (файлы: scenario_ru.mp3, scenario_pl.mp3, scenario_de.mp3)
     Output:      /Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/ПРОМПТЫ
 
 Install:
@@ -45,8 +44,8 @@ Run:
     python3 psych_prompt_pipeline_v2.py
     python3 psych_prompt_pipeline_v2.py --all
     python3 psych_prompt_pipeline_v2.py --file-ru "/path/RU.mp3"
-    python3 psych_prompt_pipeline_v2.py --theme "про человека, который 10 лет ездит на одной машине; о потреблении, статусе и внутренней стабильности"
-    python3 psych_prompt_pipeline_v2.py --target-seconds 2.35
+    python3 psych_prompt_pipeline_v2.py --theme "о трансформации личности, тени и внутреннем порядке в хаосе"
+    python3 psych_prompt_pipeline_v2.py --target-seconds 7
 """
 
 from __future__ import annotations
@@ -71,9 +70,6 @@ from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError, 
 # ============================================================
 # 1) PATHS & API
 # ============================================================
-# ВАЖНО: озвучки читаются из папки ОЗВУЧКА — именно туда voicer_batch_tts_RU_PL_DE.py
-# сохраняет scenario_ru.mp3 / scenario_pl.mp3 / scenario_de.mp3. Папки обязаны совпадать,
-# иначе пайплайн подхватит не те (старые) файлы.
 DEFAULT_VOICEOVER_FOLDER = "/Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/ОЗВУЧКА"
 DEFAULT_PROMPTS_FOLDER   = "/Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/ПРОМПТЫ"
 
@@ -81,7 +77,7 @@ DEFAULT_PROMPTS_FOLDER   = "/Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ
 OPENAI_API_KEY = ""
 
 TRANSCRIBE_MODEL = os.getenv("TRANSCRIBE_MODEL", "whisper-1")
-# Дёшево и быстро: gpt-4o-mini вместо дорогой gpt-5.4. Можно переопределить через env PROMPT_MODEL.
+# Дёшево и быстро: gpt-4o-mini вместо дорогой gpt-5.4. Переопределяется env PROMPT_MODEL.
 PROMPT_MODEL     = os.getenv("PROMPT_MODEL", "gpt-4o-mini")
 
 LANGUAGE_ORDER = ["ru", "pl", "de"]
@@ -105,211 +101,211 @@ LANGUAGES: dict[str, dict[str, Any]] = {
 
 SUPPORTED_INPUTS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".mp4", ".mov", ".mkv", ".webm"}
 
-DEFAULT_TARGET_SECONDS = 2.35
-MIN_BLOCK_SECONDS      = 1.0
-MAX_BLOCK_SECONDS      = 3.0
-SOFT_TARGET_SECONDS    = 2.35
-MAX_WORDS_PER_IMAGE    = 18
+# One image roughly every 7 seconds (раньше было ~2.35с — картинки менялись слишком часто).
+DEFAULT_TARGET_SECONDS = 7.0
+MIN_BLOCK_SECONDS      = 6.0
+MAX_BLOCK_SECONDS      = 8.5
+SOFT_TARGET_SECONDS    = 7.0
+MAX_WORDS_PER_IMAGE    = 45
 DEFAULT_PROMPT_WORKERS = int(os.getenv("PROMPT_WORKERS", "4"))
 # Больше блоков в одном запросе -> меньше вызовов API -> дешевле (системный промпт
 # и инструкции отправляются реже) и быстрее. Переопределяется env PROMPT_BATCH_SIZE.
 DEFAULT_PROMPT_BATCH_SIZE = int(os.getenv("PROMPT_BATCH_SIZE", "24"))
 
 # ============================================================
-# 2) GLOBAL ART STYLE + CHARACTER SHEET + VIDEO THEME
+# 2) GLOBAL ART STYLE + FIGURE SHEET + VIDEO THEME
 # ------------------------------------------------------------
 # Эти строки добавляются в КАЖДЫЙ финальный промпт, чтобы все кадры были в одном
-# стиле и с одним и тем же героем. ВАЖНО: локация сюда больше НЕ зашита —
-# окружение задаётся отдельно для каждой сцены, поэтому герой может быть где угодно.
+# эпично-живописном стиле. ВАЖНО: НЕТ постоянного персонажа — если в кадре есть
+# человек, это анонимная безликая фигура. Локация задаётся отдельно для каждой сцены.
 # ============================================================
 ART_STYLE = (
-    "flat 2D hand-drawn cartoon illustration, minimalist webcomic explainer style, "
-    "simple clean thin black outlines, flat cel shading with no gradients, "
-    "muted earthy color palette of sage green, olive, cream, beige and soft warm grey, "
-    "simple shapes and very few details, soft oval drop shadow under each figure, "
-    "flat even soft lighting, plenty of empty negative space, calm restrained quiet mood, "
-    "simple and clean, storyboard frame"
+    "epic painterly digital oil painting, cinematic concept art, thick expressive impasto "
+    "brushstrokes and visible palette-knife texture, dramatic volumetric lighting with glowing "
+    "god-rays and radiant light, rich palette of molten gold, warm amber and deep crimson red with "
+    "dark shadow, high contrast between blazing warm light and deep shadow, vast sublime scale, "
+    "surreal symbolic and mythic atmosphere, awe-inspiring and reverent mood, atmospheric haze and "
+    "glowing embers, dramatic sky, matte-painting depth, monumental and emotional"
 )
 
 # ТЕМА РОЛИКА. Описывает, О ЧЁМ это конкретное видео, чтобы модель подбирала
-# уместные сцены и реквизит (а не случайные предметы). Можно переопределить:
+# уместные сцены и символы. Можно переопределить:
 #   export VIDEO_THEME="..."
 # или флагом:  --theme "..."
 DEFAULT_VIDEO_THEME = (
-    "a calm psychology video about consumer culture and the urge to constantly replace things "
-    "(phones, shoes, furniture, gadgets, cars, even relationships and identity), advertising that "
-    "manufactures dissatisfaction, status symbols and social comparison, and the quiet inner "
-    "stability of a person who is content with what he already has. "
-    "An old car kept for ten years is only the RECURRING EXAMPLE that opens and closes the video — "
-    "it is NOT what every scene is about. Most lines are about consumption in general, not cars."
+    "a deep, contemplative psychology and philosophy video about the inner journey of a person: "
+    "confronting fear and the unknown, personal transformation and rebirth, facing one's shadow, "
+    "the search for meaning, and finding a hidden order within chaos. "
+    "The visuals are metaphorical and symbolic rather than literal — a lone anonymous human before "
+    "something vast and luminous."
 )
 VIDEO_THEME = (os.getenv("VIDEO_THEME", "").strip() or DEFAULT_VIDEO_THEME)
 
-# The ONE recurring protagonist. Always rendered the same way.
-# ВАЖНО: это ЕДИНСТВЕННОЕ место, где описан персонаж. Меняй здесь —
-# и все промпты на всех языках сразу станут с правильным персонажем.
-#   export MAIN_CHARACTER_DESC="the main character is ..."
-# или флагом:  --character "the main character is ..."
-DEFAULT_MAIN_CHARACTER = (
-    "the main character is a young man with short tousled brown hair (he is NOT bald), "
-    "a simple minimal cartoon face (two small dot eyes and a small subtle mouth), light plain skin, "
-    "wearing an olive-green hooded sweatshirt and matching green sweatpants, drawn in the same flat cartoon style"
+# How any human FIGURE in the frame is rendered. There is NO fixed recurring character.
+# Если в сцене есть человек — он безликий, анонимный, маленький в масштабе.
+#   export FIGURE_DESC="..."
+# или флагом:  --figure "..."
+DEFAULT_FIGURE_STYLE = (
+    "any human figure is an anonymous everyperson — a small lone silhouette seen mostly from behind "
+    "or in dark contour, without a recognizable face or identifying features, dwarfed by the immense "
+    "glowing scene, painted in the same epic oil-painting style; there is NO fixed recurring character"
+)
+FIGURE_STYLE = (os.getenv("FIGURE_DESC", "").strip() or DEFAULT_FIGURE_STYLE)
+
+# How a CROWD / other people must look when the line is about society, the masses, others.
+CROWD_STYLE = (
+    "crowds or other people are rendered as vast masses of faceless dark silhouettes, an anonymous "
+    "sea of figures, painted loosely with the same brushwork, never individualized"
 )
 
-MAIN_CHARACTER = (os.getenv("MAIN_CHARACTER_DESC", "").strip() or DEFAULT_MAIN_CHARACTER)
-
-# How every OTHER person in the frame must look (the crowd / family / society).
-OTHERS_STYLE = (
-    "any other people are drawn as plain blank pure-white humanoid figures with smooth featureless "
-    "white bodies and little or no facial features, clearly contrasting with the colored main character"
-)
-
-# Things we never want from the image model.
+# Things we never want from the image model. NOTE: we now WANT painterly cinematic light,
+# so we only forbid photographic realism, 3d renders, and any text/logos.
 NEGATIVE_SUFFIX = (
-    "no photorealism, no 3d render, no realistic photo, no cinematic lighting, no film grain, "
-    "no detailed realistic background, no text, no captions, no watermark, no logo, no signature"
+    "no photorealism, no realistic photograph, no 3d render, no cartoon, no flat vector, no anime, "
+    "no text, no captions, no subtitles, no watermark, no logo, no signature, no modern clutter"
 )
 
 # ============================================================
-# 3) SCENE DIVERSITY BANKS  (общие, бытовые, с РАЗНЫМИ локациями)
+# 3) SCENE DIVERSITY BANKS  (эпичные, символические, разные локации)
 # ------------------------------------------------------------
-# ВАЖНО: эти банки модели БОЛЬШЕ НЕ ПОКАЗЫВАЮТСЯ как подсказки — иначе они тянули бы
-# её к заранее заданным местам/предметам. Локацию и реквизит модель выбирает САМА из
-# смысла конкретной реплики. Банки остаются только как тихий fallback в normalize_scene,
-# если модель вдруг вернула пустое или явно generic поле.
+# ВАЖНО: банки модели БОЛЬШЕ НЕ ПОКАЗЫВАЮТСЯ как подсказки — иначе они тянули бы её к
+# заранее заданным местам. Локацию и символ модель выбирает САМА из смысла реплики.
+# Банки остаются только как тихий fallback в normalize_scene, если поле пустое/generic.
 # ============================================================
 SCENE_TYPES: dict[str, dict[str, str]] = {
-    "subject_alone": {
-        "description": "Main character alone in a setting that fits the narration, full body, calm.",
-        "template": "main character alone in a meaningful simple setting",
+    "figure_before_vastness": {
+        "description": "A lone anonymous figure stands small before an immense glowing landscape or light.",
+        "template": "tiny lone silhouette facing a vast luminous scene",
     },
-    "with_object": {
-        "description": "Character interacting with a key object that embodies the topic (e.g. his old car, a phone, a thing he keeps).",
-        "template": "character touching or using the object the story is about",
+    "pure_landscape": {
+        "description": "No people — only an epic symbolic landscape (sunrise, sea of light, burning sky).",
+        "template": "epic empty symbolic landscape, no figure",
     },
-    "in_environment": {
-        "description": "Character placed in a specific everyday location relevant to the line (street, driveway, shop, road).",
-        "template": "character standing inside a clear real-world location",
+    "the_crowd": {
+        "description": "A vast sea of faceless silhouettes / the masses, sometimes with one figure apart.",
+        "template": "immense crowd of faceless silhouettes",
     },
-    "others_around": {
-        "description": "Blank white figures (neighbours, crowd, society) react, watch, or pass by the character.",
-        "template": "blank white figures around the main character",
+    "figure_and_crowd": {
+        "description": "One lone figure set apart from or facing an anonymous crowd, showing the individual vs the many.",
+        "template": "single figure contrasted against a faceless crowd",
     },
-    "comparison_split": {
-        "description": "Character/old thing on one side, blank figures or a shiny new thing on the other, to show contrast.",
-        "template": "side-by-side contrast: the character's old thing vs a new shiny one",
+    "threshold_or_choice": {
+        "description": "A doorway, path of light, or gates — the figure at a threshold, about to cross or choose.",
+        "template": "figure at a glowing threshold or fork of paths",
     },
-    "observed_or_judged": {
-        "description": "A blank white figure questions, points at, or looks at the character, who stays calm.",
-        "template": "white figure asking or judging, character unbothered",
+    "cosmic_or_giant": {
+        "description": "A colossal luminous being / cosmic giant of nebula and stars looms over a tiny person.",
+        "template": "cosmic giant of stars looming over a small figure",
+    },
+    "monoliths_or_pillars": {
+        "description": "Monumental stone monoliths, pillars, mirrors or columns around a small figure.",
+        "template": "small figure among towering monoliths",
+    },
+    "ascent_or_descent": {
+        "description": "The figure climbing, descending, or moving through a dramatic passage toward light or dark.",
+        "template": "figure ascending or descending through dramatic light",
+    },
+    "inner_storm": {
+        "description": "Swirling embers, sparks, fire, or chaos of light expressing an inner emotional state.",
+        "template": "swirling storm of light and embers around a figure",
     },
     "symbolic_metaphor": {
-        "description": "A single simple floating symbol expresses the idea of the line (price tag, sparkle, arrow, anchor).",
-        "template": "one clear simple symbol expressing the idea",
+        "description": "A single powerful floating symbol dominates the frame (thread of light, spiral, cracked mirror).",
+        "template": "one dominant glowing symbol filling the scene",
     },
-    "in_transit": {
-        "description": "Character moving through the world: driving, walking, going somewhere.",
-        "template": "character driving or walking, in motion",
+    "reflection_or_mirror": {
+        "description": "The figure faces a reflection, mirror, or double — the self confronting itself.",
+        "template": "figure facing its own reflection or double",
     },
-    "contemplative": {
-        "description": "Character pauses and reflects, relaxed and thoughtful.",
-        "template": "character standing or sitting, calm and reflective",
-    },
-    "surrounded_by_choices": {
-        "description": "Character among many products / options / shiny new things to show pressure to upgrade.",
-        "template": "character surrounded by many tempting new objects",
-    },
-    "calm_contrast": {
-        "description": "Character is calm and content while blank white figures rush, upgrade, or chase the new.",
-        "template": "calm character while white figures rush around him",
+    "revelation": {
+        "description": "A blinding burst of radiant light, an epiphany, a sun breaking over the horizon.",
+        "template": "radiant burst of light, a moment of revelation",
     },
 }
 
 DEFAULT_CAMERA_BY_TYPE = {
-    "subject_alone":          "full-body wide shot at eye level, character centered",
-    "with_object":            "full-body medium-wide shot showing the character and the object",
-    "in_environment":         "wide shot showing the character inside the location",
-    "others_around":          "full-body wide shot, character centered among the white figures",
-    "comparison_split":       "wide shot with both sides framed for contrast",
-    "observed_or_judged":     "full-body medium-wide shot, slight side angle on both figures",
-    "symbolic_metaphor":      "medium full-body shot, the floating symbol clearly visible",
-    "in_transit":             "side-on wide shot showing motion",
-    "contemplative":          "medium full-body shot, slight side angle",
-    "surrounded_by_choices":  "wide shot with the character among many objects",
-    "calm_contrast":          "wide shot, calm character still while figures blur past",
+    "figure_before_vastness":  "extreme wide shot, tiny figure low in a huge frame, seen from behind",
+    "pure_landscape":          "sweeping epic wide landscape shot, no figure",
+    "the_crowd":               "vast high wide shot over an endless crowd of silhouettes",
+    "figure_and_crowd":        "wide shot, single figure foreground, crowd filling the background",
+    "threshold_or_choice":     "wide symmetrical shot, figure centered before the threshold",
+    "cosmic_or_giant":         "low-angle wide shot looking up at the towering cosmic figure",
+    "monoliths_or_pillars":    "wide shot, small figure dwarfed among the monoliths",
+    "ascent_or_descent":       "dramatic wide shot emphasizing vertical scale",
+    "inner_storm":             "medium-wide shot, figure engulfed by swirling light",
+    "symbolic_metaphor":       "centered wide shot, the glowing symbol dominating the frame",
+    "reflection_or_mirror":    "wide shot showing the figure and its reflection",
+    "revelation":              "wide shot into a blinding radiant light source",
 }
 
-# Разнообразные минималистичные БЫТОВЫЕ локации (дом, магазины, улица + ОДНА-две авто).
-# Намеренно общие: машина здесь лишь один из вариантов, а не основа.
+# Эпичные символические локации (референс-стиль: обрывы, сияющее море, столпы света, космос).
 ENVIRONMENT_BANK = [
-    "simple living room with a sofa and a low table",
-    "simple kitchen with a plain counter and one cup",
-    "minimal bedroom with a bed and a small shelf",
-    "plain shop interior with simple shelves of products",
-    "minimal electronics store wall with a row of identical phones",
-    "simple shoe-shop shelf with a few pairs of shoes",
-    "quiet residential street suggested by a sidewalk and one small tree",
-    "sidewalk in front of a simple house",
-    "minimal park suggested by a bench and a single tree",
-    "bare cream room with two walls meeting in a corner and a grey-green floor",
-    "wide empty horizon with a flat ground line and open sky",
-    "simple driveway with a plain older car parked on it",
-    "minimal interior of an old car, simple dashboard and steering wheel",
-    "small living room glowing from a TV showing an advert",
+    "the edge of a towering red cliff overlooking an endless glowing golden sea at sunrise",
+    "a vast luminous plain stretching to a blazing sun on the horizon",
+    "a cathedral of golden god-ray light beams falling from a deep blood-red sky",
+    "an immense crowd of faceless silhouettes stretching to the horizon under a red sky",
+    "a surreal hall of colossal cracked stone monoliths in crimson and gold",
+    "a colossal cosmic giant made of nebulae and stars looming over a tiny figure",
+    "an infinite golden desert beneath a burning amber sky",
+    "a single narrow path of light cutting through vast darkness",
+    "a storm of swirling golden embers and sparks in a dark void",
+    "a mirror-smooth reflective plain glowing under a radiant low sun",
+    "a row of monumental doorways of light standing in darkness",
+    "molten golden waves rolling toward a red horizon",
+    "a lone figure on a dark ridge silhouetted against a glowing sky",
+    "a shattered mirror standing upright in a glowing golden wasteland",
 ]
 
-# Простые, читаемые действия и жесты (бытовые, по теме «вещи / выбор / спокойствие»).
-# Общие, НЕ привязанные к машине: предмет в руках зависит от конкретной реплики.
+# Символические действия/позы (референс-стиль). Общие, метафоричные.
 ACTION_BANK = [
-    "standing calmly with a relaxed, easy posture",
-    "holding an old worn phone while ignoring a shiny new one",
-    "looking at a wall of identical new products without reaching for any",
-    "shrugging lightly in answer to a question",
-    "standing still and content while white figures rush past with shopping bags",
-    "walking calmly down a simple street",
-    "sitting relaxed and looking thoughtfully into the distance",
-    "crossing his arms with quiet confidence",
-    "watching a glowing advert on a screen with a calm face",
-    "keeping a familiar old object while others hold shiny new ones",
-    "fondly using a well-worn everyday object",
-    "standing between an old thing and a new shiny one, choosing the old",
-    "resting one hand fondly on his old car (only when the line is about the car)",
-    "calmly driving his old car (only when the line is about the car)",
+    "standing alone at the very edge, facing the vast glowing light",
+    "walking a thin thread of light toward the distant horizon",
+    "standing small and still before an immense luminous presence",
+    "reaching one hand toward a distant radiant sun",
+    "turning away from a dark crowd toward the light",
+    "stepping through a glowing threshold into the unknown",
+    "gazing up at a towering cosmic figure of stars",
+    "arms slightly open, engulfed in swirling golden light",
+    "kneeling small beneath a burst of radiant light",
+    "standing between towering monoliths, tiny in scale",
+    "facing its own dark reflection in a standing mirror",
+    "climbing toward a blazing light high above",
+    "silhouetted on a ridge against a burning sky",
+    "descending into deep warm shadow away from the light",
 ]
 
-# Варианты кадрирования (почти всегда полный рост, на уровне глаз).
+# Кадрирование — эпичные широкие планы, крошечная фигура в огромном кадре.
 CAMERA_BANK = [
-    "full-body wide shot at eye level, character centered",
-    "wide shot with the character drawn small in a large frame",
-    "full-body medium-wide shot, slight side angle",
-    "front-facing full-body shot at eye level",
-    "wide shot showing the whole location and the floor shadow",
-    "medium full-body shot focused on the character and one object",
-    "side-on wide shot showing motion",
-    "wide symmetrical shot with the character in the middle",
+    "extreme wide shot, tiny lone figure low in a huge frame, seen from behind",
+    "sweeping epic wide landscape shot with deep atmospheric distance",
+    "low-angle wide shot looking up at something towering and luminous",
+    "vast high wide shot over an endless crowd of silhouettes",
+    "centered symmetrical wide shot with a glowing focal light",
+    "dramatic wide shot emphasizing vertical scale and depth",
+    "wide silhouette shot, dark figure against blazing light",
+    "medium-wide shot, figure engulfed by swirling light and embers",
 ]
 
 EMOTION_BANK = [
-    "calm contentment", "quiet confidence", "unbothered ease",
-    "peaceful satisfaction", "mild nostalgia", "gentle pride",
-    "thoughtful calm", "secure and grounded", "indifference to trends",
-    "quiet stubborn loyalty", "relaxed familiarity", "settled inner stability",
+    "awe and reverence", "existential wonder", "solemn transformation", "the sublime",
+    "quiet resolve", "overwhelmed insignificance", "spiritual awakening", "sacred dread",
+    "hope breaking through", "profound stillness", "transcendence", "longing toward the light",
 ]
 
-# Простые символы под тему потребления/статуса/стабильности (плюс «no symbol»).
+# Мощные символы под тему трансформации/поиска смысла/порядка в хаосе (плюс «no symbol»).
 SYMBOL_BANK = [
     "no symbol",
     "no symbol",
-    "a glowing price tag or dollar sign",
-    "a shiny 'new' sparkle effect on an object",
-    "a small upward status arrow",
-    "a steady anchor symbol for stability",
-    "a thought bubble with a question mark",
-    "a clock or calendar showing years passing",
-    "a small heart of attachment over an old object",
-    "a row of identical shiny new products",
-    "a green checkmark of contentment",
-    "a treadmill / hamster-wheel symbol of endless upgrading",
+    "a single glowing thread or line of light",
+    "a radiant sun bursting over the horizon",
+    "a swirling galaxy or cosmic spiral",
+    "a shattered mirror reflecting light",
+    "a doorway of pure light in darkness",
+    "a lone flame or ember rising",
+    "a towering monolith of stone",
+    "a vast sea of faceless silhouettes",
+    "an ascending path of light",
+    "hidden geometric order glowing within chaos",
 ]
 
 DIVERSITY_MEMORY = 12
@@ -318,8 +314,8 @@ MAX_SAME_ENV_IN_RECENT  = 2
 MAX_SAME_CAM_IN_RECENT  = 3
 MAX_SAME_SYM_IN_RECENT  = 2
 
-GENERIC_ENV_PATTERNS = [r"\bgeneric room\b", r"\binterior\b$", r"^\s*room\s*$", r"^\s*space\s*$"]
-GENERIC_ACT_PATTERNS = [r"holding still", r"looking away", r"standing quietly", r"sitting quietly"]
+GENERIC_ENV_PATTERNS = [r"\bgeneric\b", r"\binterior\b$", r"^\s*room\s*$", r"^\s*space\s*$", r"^\s*background\s*$"]
+GENERIC_ACT_PATTERNS = [r"holding still", r"looking away", r"standing quietly", r"sitting quietly", r"doing nothing"]
 
 # ============================================================
 # 4) DATACLASSES
@@ -351,7 +347,7 @@ class PromptRow:
     environment: str
     action: str
     emotion: str
-    others: str
+    figure: str
     symbol: str
     camera_framing: str
     image_prompt: str
@@ -612,29 +608,32 @@ SCENE_TYPE_REFERENCE = "\n".join(f"- {k}: {v['description']}" for k, v in SCENE_
 
 
 def build_system_prompt() -> str:
-    """Системный промпт строится из ТЕКУЩИХ VIDEO_THEME и MAIN_CHARACTER (их можно
+    """Системный промпт строится из ТЕКУЩИХ VIDEO_THEME и FIGURE_STYLE (их можно
     поменять через env/флаги), поэтому это функция, а не константа на момент импорта."""
     # Компактный системный промпт (меньше токенов на каждый вызов = дешевле/быстрее).
     return f"""
-You plan visual scenes for a psychology short video in a FLAT 2D HAND-DRAWN MINIMALIST CARTOON
-("webcomic / explainer") style. ONE recurring main character appears in every scene.
+You plan visual scenes for a deep psychology / philosophy short video told as EPIC PAINTERLY DIGITAL
+OIL PAINTINGS (cinematic concept-art): monumental, symbolic, awe-inspiring frames bathed in golden and
+deep-red light. This is metaphorical art, NOT literal illustration.
 
-VIDEO TOPIC (pick relevant settings/props from it): {VIDEO_THEME}
+VIDEO TOPIC (pick relevant symbols/settings from it): {VIDEO_THEME}
 ART STYLE (fixed, added automatically — do NOT restate): {ART_STYLE}
-MAIN CHARACTER (fixed, keep identical; do NOT restate his look/clothes/hair, never call him bald): {MAIN_CHARACTER}
-OTHER PEOPLE: {OTHERS_STYLE}
+HUMAN FIGURES (NO fixed recurring character): {FIGURE_STYLE}
+CROWDS: {CROWD_STYLE}
 
-For each spoken line, design ONE clear cartoon scene that VISUALLY COMMUNICATES that line's meaning.
+For each spoken line, design ONE powerful cinematic scene that visually and symbolically communicates
+that line's meaning, grounded in the topic.
 
 RULES:
-- Illustrate the SPECIFIC current line (show whatever object it mentions), not the overall topic.
-- Show a car ONLY when the line is literally about the car/driving — it's just the opening/closing example.
-- CHANGE the environment scene to scene; the bare cream room is only one option, don't reuse it.
-- Blank white figures only when the line is about other people/society/comparison; else "none".
-- A symbol only when it truly helps; else "no symbol".
-- Minimalist: few props, empty space, simple shapes. Never realistic/photographic.
+- No consistent protagonist; never describe a face/hair/clothes/identity. Any human = anonymous, faceless,
+  small silhouette (often from behind).
+- Prefer symbolic metaphor over literal depiction (light, darkness, scale, thresholds, crowds, cosmos,
+  monoliths, storms, mirrors). Some scenes have NO figure — a pure landscape (scene_type "pure_landscape").
+- CHANGE the scene dramatically line to line: vary environment, scale, symbol, composition.
+- Crowds only when the line is about people/society/the masses; else "none". A strong symbol only when it helps; else "no symbol".
+- Majestic mood, few but powerful elements. Never photographic, never cartoon, never modern clutter.
 
-Return JSON only, no prose. Describe ONLY scene content (pose, location, other figures, optional symbol, framing).
+Return JSON only, no prose. Describe ONLY scene content (what/who is in frame, setting, symbol, composition).
 """.strip()
 
 
@@ -676,28 +675,31 @@ LANGUAGE: {lang_name} ({lang_code}). All scene fields in English; the voiceover 
 VIDEO TOPIC: {VIDEO_THEME}
 
 SCENE TYPES: {SCENE_TYPE_REFERENCE}
-RECENT SCENES (make the next ones visually different, esp. LOCATION): {json.dumps(recent_compact, ensure_ascii=False)}
+RECENT SCENES (make the next ones visually different, esp. SETTING and SYMBOL): {json.dumps(recent_compact, ensure_ascii=False)}
 CAMERA OPTIONS (framing only, not content): {json.dumps(cam_pool)}
 
 BLOCKS:
 {json.dumps(build_blocks_payload(blocks), ensure_ascii=False)}
 
-For each block output ONE item. Decide the location and props yourself from current_text's meaning
-(buying -> shop; scrolling -> phone; home comfort -> room; others judging -> public place with white figures).
-Each scene must visually communicate that block's spoken text: if watched without sound, the idea should read.
+For each block output ONE item. From current_text's meaning, decide the most powerful epic visual metaphor
+(a lone figure before the sublime, a crowd, a threshold of light, a cosmic giant, a storm of embers,
+a shattered mirror, a path of light through darkness, a burning horizon...). A human figure is OPTIONAL
+and always anonymous/faceless — prefer "no figure" when a pure landscape says it better.
+Each scene must make the idea readable without sound, as an epic painterly image in golden and crimson light.
 
-Return JSON: {{"items": [{{"index": <int>, "scene_type": "<one scene type>", "subject": "the main character ... (pose/expression only)", "others": "<white figures + what they do, or 'none'>", "symbol": "<one simple symbol, or 'no symbol'>", "environment": "<concrete simple location fitting the line>", "action": "<one visible action embodying the line>", "emotion": "<inner state>", "camera_framing": "<simple framing>", "reason": "<one sentence>"}}]}}
+Return JSON: {{"items": [{{"index": <int>, "scene_type": "<one scene type>", "subject": "<what is in frame; anonymous faceless silhouette, or 'no figure'>", "crowd": "<faceless crowd + what it does, or 'none'>", "symbol": "<one powerful symbol, or 'no symbol'>", "environment": "<concrete epic symbolic setting fitting the line>", "action": "<the core visible event>", "emotion": "<dominant mood>", "camera_framing": "<epic wide framing>", "reason": "<one sentence>"}}]}}
 
-Rules: exactly one item per block; all English; 4-12 words per field. subject starts with "the main character"
-(pose/expression only, no clothing/art style). Illustrate the SPECIFIC current_text. No car unless the line is
-about the car/driving. Vary environment across scenes. Other people = blank white figures, only when the line is
-about others else "none". Symbol only if it truly helps else "no symbol". Keep everything minimalist.
+Rules: exactly one item per block; all English; 4-14 words per field. subject is anonymous/faceless (never a
+named character, no clothing/face) or "no figure". Illustrate the SPECIFIC current_text as an epic metaphor.
+Vary setting/scale/symbol across scenes; keep every frame monumental and painterly. Crowds = vast faceless
+silhouettes, only when the line is about people/society else "none". Symbol only if it truly helps else "no symbol".
+Never photographic, cartoon, or cluttered.
 """.strip()
 
     response = api_call(
         lambda: client.chat.completions.create(
             model=PROMPT_MODEL,
-            temperature=0.8,
+            temperature=0.85,
             response_format={"type": "json_object"},
             messages=[
                 {"role": "system", "content": build_system_prompt()},
@@ -712,28 +714,36 @@ about others else "none". Symbol only if it truly helps else "no symbol". Keep e
 
 
 def build_final_prompt(scene: dict) -> str:
-    """Assemble the full image prompt: global style + fixed character + scene content + symbol + framing + negatives."""
-    subject = clean_text(scene.get("subject", "")) or "the main character standing calmly"
+    """Assemble the full image prompt: global epic style + scene content + crowd + symbol + framing + negatives.
+    NOTE: no fixed character is injected; a figure is only present if the scene calls for one."""
+    subject = clean_text(scene.get("subject", ""))
     action = clean_text(scene.get("action", ""))
-    others = clean_text(scene.get("others", ""))
+    crowd = clean_text(scene.get("crowd", ""))
     symbol = clean_text(scene.get("symbol", ""))
     environment = clean_text(scene.get("environment", ""))
     emotion = clean_text(scene.get("emotion", ""))
     framing = clean_text(scene.get("camera_framing", ""))
 
     # Drop "empty" sentinels
-    if others.lower() in {"", "none", "no one", "nobody"}:
-        others = ""
+    no_figure = subject.lower() in {"", "no figure", "none", "no person", "empty"}
+    if crowd.lower() in {"", "none", "no one", "nobody"}:
+        crowd = ""
     if symbol.lower() in {"", "no symbol", "none"}:
         symbol = ""
 
-    parts = [
-        ART_STYLE,
-        MAIN_CHARACTER,
-        ", ".join(p for p in [subject, action] if p),
-    ]
-    if others:
-        parts.append(f"{others}; {OTHERS_STYLE}")
+    parts = [ART_STYLE]
+
+    # The subject / main visual content of the frame.
+    if no_figure:
+        # pure landscape: the action still describes the core visual event, no figure sheet added
+        if action:
+            parts.append(action)
+    else:
+        parts.append(", ".join(p for p in [subject, action] if p))
+        parts.append(FIGURE_STYLE)
+
+    if crowd:
+        parts.append(f"{crowd}; {CROWD_STYLE}")
     if symbol:
         parts.append(f"symbolic element: {symbol}")
     if environment:
@@ -748,11 +758,10 @@ def build_final_prompt(scene: dict) -> str:
 
 def normalize_scene(raw: dict, b: VisualBlock, recent: list[dict], salt: int) -> dict:
     """ДОВЕРЯЕМ модели. Берём её поля как есть; банк используется только если поле
-    пустое или явно generic. Никакой жёсткой случайной подмены (это раньше ломало
-    связь картинки с текстом)."""
-    scene_type = clean_text(raw.get("scene_type", "")) or "subject_alone"
+    пустое или явно generic. Никакого постоянного персонажа — фигура анонимна/опциональна."""
+    scene_type = clean_text(raw.get("scene_type", "")) or "figure_before_vastness"
     if scene_type not in SCENE_TYPES:
-        scene_type = "subject_alone"
+        scene_type = "figure_before_vastness"
 
     environment = clean_text(raw.get("environment", ""))
     if not environment or is_generic(environment, GENERIC_ENV_PATTERNS):
@@ -765,15 +774,17 @@ def normalize_scene(raw: dict, b: VisualBlock, recent: list[dict], salt: int) ->
     emotion = clean_text(raw.get("emotion", "")) or pick_fallback(EMOTION_BANK, recent, "emotion", 3, salt + 2)
 
     camera = clean_text(raw.get("camera_framing", "")) or \
-        DEFAULT_CAMERA_BY_TYPE.get(scene_type, "full-body wide shot at eye level, character centered")
+        DEFAULT_CAMERA_BY_TYPE.get(scene_type, "extreme wide shot, tiny lone figure low in a huge frame")
 
-    subject = clean_text(raw.get("subject", "")) or "the main character"
-    if not subject.lower().startswith("the main character"):
-        subject = f"the main character, {subject}"
+    # subject: anonymous figure or explicit "no figure" for pure landscapes.
+    subject = clean_text(raw.get("subject", ""))
+    if not subject:
+        subject = "no figure" if scene_type == "pure_landscape" else "a lone anonymous silhouette"
 
-    others = clean_text(raw.get("others", ""))
-    if others.lower() in {"none", "no one", "nobody", ""}:
-        others = "none"
+    # accept crowd from "crowd" or legacy "others" field
+    crowd = clean_text(raw.get("crowd", "")) or clean_text(raw.get("others", ""))
+    if crowd.lower() in {"none", "no one", "nobody", ""}:
+        crowd = "none"
 
     symbol = clean_text(raw.get("symbol", ""))
     if symbol.lower() in {"no symbol", "none", ""}:
@@ -782,7 +793,7 @@ def normalize_scene(raw: dict, b: VisualBlock, recent: list[dict], salt: int) ->
     return {
         "scene_type": scene_type,
         "subject": subject,
-        "others": others,
+        "crowd": crowd,
         "symbol": symbol,
         "environment": environment,
         "action": action,
@@ -793,26 +804,26 @@ def normalize_scene(raw: dict, b: VisualBlock, recent: list[dict], salt: int) ->
 
 
 FALLBACK_SCENES = [
-    {"scene_type": "with_object", "subject": "the main character holding a worn everyday object he keeps",
-     "others": "none", "symbol": "no symbol",
-     "environment": "simple living room with a sofa and a low table",
-     "action": "fondly using a well-worn everyday object",
-     "emotion": "calm contentment", "camera_framing": "full-body medium-wide shot showing the character and the object"},
-    {"scene_type": "calm_contrast", "subject": "the main character standing calm and still",
-     "others": "several blank white figures rush past carrying shopping bags", "symbol": "no symbol",
-     "environment": "plain shop interior with simple shelves of products",
-     "action": "standing still and content while white figures rush past with shopping bags",
-     "emotion": "unbothered ease", "camera_framing": "wide shot, calm character still while figures blur past"},
-    {"scene_type": "surrounded_by_choices", "subject": "the main character calmly facing a wall of new products",
-     "others": "none", "symbol": "a row of identical shiny new products",
-     "environment": "minimal electronics store wall with a row of identical phones",
-     "action": "looking at a wall of identical new products without reaching for any",
-     "emotion": "indifference to trends", "camera_framing": "wide shot with the character among many objects"},
-    {"scene_type": "symbolic_metaphor", "subject": "the main character standing grounded and still",
-     "others": "none", "symbol": "a treadmill / hamster-wheel symbol of endless upgrading",
-     "environment": "bare cream room with two walls meeting in a corner and a grey-green floor",
-     "action": "standing calmly with a relaxed, easy posture",
-     "emotion": "settled inner stability", "camera_framing": "medium full-body shot, the floating symbol clearly visible"},
+    {"scene_type": "figure_before_vastness", "subject": "a lone anonymous silhouette seen from behind",
+     "crowd": "none", "symbol": "a radiant sun bursting over the horizon",
+     "environment": "the edge of a towering red cliff overlooking an endless glowing golden sea at sunrise",
+     "action": "standing alone at the very edge, facing the vast glowing light",
+     "emotion": "awe and reverence", "camera_framing": "extreme wide shot, tiny figure low in a huge frame, seen from behind"},
+    {"scene_type": "the_crowd", "subject": "a vast sea of faceless dark silhouettes",
+     "crowd": "an endless anonymous crowd stretching to the horizon", "symbol": "no symbol",
+     "environment": "an immense crowd of faceless silhouettes stretching to the horizon under a red sky",
+     "action": "an ocean of silhouettes facing a distant burning light",
+     "emotion": "overwhelmed insignificance", "camera_framing": "vast high wide shot over an endless crowd of silhouettes"},
+    {"scene_type": "cosmic_or_giant", "subject": "a tiny anonymous figure beneath a colossal cosmic being",
+     "crowd": "none", "symbol": "a swirling galaxy or cosmic spiral",
+     "environment": "a colossal cosmic giant made of nebulae and stars looming over a tiny figure",
+     "action": "gazing up at a towering cosmic figure of stars",
+     "emotion": "the sublime", "camera_framing": "low-angle wide shot looking up at the towering cosmic figure"},
+    {"scene_type": "threshold_or_choice", "subject": "a small silhouette before doorways of light",
+     "crowd": "none", "symbol": "a doorway of pure light in darkness",
+     "environment": "a row of monumental doorways of light standing in darkness",
+     "action": "stepping through a glowing threshold into the unknown",
+     "emotion": "solemn transformation", "camera_framing": "wide symmetrical shot, figure centered before the threshold"},
 ]
 
 
@@ -874,7 +885,7 @@ def generate_prompts(
             environment=scene.get("environment", ""),
             action=scene.get("action", ""),
             emotion=scene.get("emotion", ""),
-            others=scene.get("others", "none"),
+            figure=scene.get("subject", ""),
             symbol=scene.get("symbol", "no symbol"),
             camera_framing=scene.get("camera_framing", ""),
             image_prompt=build_final_prompt(scene),
@@ -915,7 +926,7 @@ def write_outputs(
     # prompts.csv
     fieldnames = ["index", "language_code", "start", "end", "duration",
                   "text", "scene_type", "environment", "action", "emotion",
-                  "others", "symbol", "camera_framing", "image_prompt"]
+                  "figure", "symbol", "camera_framing", "image_prompt"]
     with (lang_dir / f"{stem}_prompts.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -926,7 +937,7 @@ def write_outputs(
                 "duration": round(r.duration, 2), "text": r.text,
                 "scene_type": r.scene_type, "environment": r.environment,
                 "action": r.action, "emotion": r.emotion,
-                "others": r.others, "symbol": r.symbol,
+                "figure": r.figure, "symbol": r.symbol,
                 "camera_framing": r.camera_framing, "image_prompt": r.image_prompt,
             })
 
@@ -1102,7 +1113,7 @@ def process_job(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="RU/PL/DE voiceover -> timecoded flat-cartoon image prompts (v2)")
+    parser = argparse.ArgumentParser(description="RU/PL/DE voiceover -> timecoded epic-painterly image prompts (v3, no fixed character)")
     parser.add_argument("--voiceover-folder", default=DEFAULT_VOICEOVER_FOLDER)
     parser.add_argument("--output-folder",    default=DEFAULT_PROMPTS_FOLDER)
     parser.add_argument("--all", action="store_true", help="Process all files in voiceover folder")
@@ -1112,13 +1123,13 @@ def main() -> None:
     parser.add_argument("--file-pl", default=None)
     parser.add_argument("--file-de", default=None)
     parser.add_argument("--target-seconds", type=float, default=DEFAULT_TARGET_SECONDS,
-                        help="Target seconds per image (1.0-3.0, default 2.35)")
+                        help="Target seconds per image (6.0-8.5, default 7.0)")
     parser.add_argument("--theme", default=None,
                         help="Тема ролика одной фразой (англ. лучше всего): о чём видео, чтобы сцены были по теме. "
-                             "По умолчанию берётся VIDEO_THEME из окружения или встроенная (про старую машину).")
-    parser.add_argument("--character", default=None,
-                        help="Переопределить описание персонажа (одной строкой, начинать с 'the main character is '). "
-                             "По умолчанию берётся MAIN_CHARACTER_DESC из окружения или встроенный (парень с волосами).")
+                             "По умолчанию берётся VIDEO_THEME из окружения или встроенная.")
+    parser.add_argument("--figure", default=None,
+                        help="Переопределить, как рисуются АНОНИМНЫЕ фигуры (одной строкой). "
+                             "Постоянного персонажа нет; по умолчанию берётся FIGURE_DESC из окружения или встроенное.")
     parser.add_argument("--force",          action="store_true", help="Regenerate even if outputs exist")
     parser.add_argument("--prompt-workers", type=int, default=DEFAULT_PROMPT_WORKERS,
                         help="Parallel GPT workers (default 4)")
@@ -1126,13 +1137,13 @@ def main() -> None:
                         help="Блоков на один запрос к модели. Больше = дешевле и быстрее (default 24)")
     args = parser.parse_args()
 
-    global MAIN_CHARACTER, VIDEO_THEME
-    if args.character and args.character.strip():
-        MAIN_CHARACTER = args.character.strip()
+    global FIGURE_STYLE, VIDEO_THEME
+    if args.figure and args.figure.strip():
+        FIGURE_STYLE = args.figure.strip()
     if args.theme and args.theme.strip():
         VIDEO_THEME = args.theme.strip()
-    print(f"VIDEO THEME:    {VIDEO_THEME}")
-    print(f"MAIN CHARACTER: {MAIN_CHARACTER}")
+    print(f"VIDEO THEME: {VIDEO_THEME}")
+    print(f"FIGURE:      {FIGURE_STYLE}")
 
     api_key = get_api_key()
     if not api_key:
