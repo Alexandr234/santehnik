@@ -16,7 +16,7 @@ Voicer API batch TTS generator (RU / PL / DE).
    из самого шаблона — их не нужно дублировать в теле задачи.
 
 4. Сохраняет результат в папку:
-   /Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/СКРИПТ ОЗВУЧКИ
+   /Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/ОЗВУЧКА
    (именно отсюда следующий скрипт — psych_prompt_pipeline_v2 — берёт озвучки,
    поэтому папки должны совпадать: scenario_ru.mp3 / scenario_pl.mp3 / scenario_de.mp3)
 
@@ -70,7 +70,7 @@ SCENARIOS_DIR = BASE_DIR / "СЦЕНАРИИ"
 # ВАЖНО: сюда же смотрит следующий скрипт (psych_prompt_pipeline_v2 ->
 # DEFAULT_VOICEOVER_FOLDER). Папки обязаны совпадать, иначе пайплайн возьмёт
 # не те (старые) озвучки. Имена файлов: scenario_ru.mp3 / scenario_pl.mp3 / scenario_de.mp3.
-OUTPUT_DIR = BASE_DIR / "СКРИПТ ОЗВУЧКИ"
+OUTPUT_DIR = BASE_DIR / "ОЗВУЧКА"
 
 # UUID шаблона из API. Именно его голосом озвучиваются все файлы.
 # Голос / модель / движок / водяной знак / настройки берутся из шаблона.
