@@ -15,8 +15,10 @@ Voicer API batch TTS generator (RU / PL / DE).
    Голос, модель, движок, снятие водяного знака и прочие настройки берутся
    из самого шаблона — их не нужно дублировать в теле задачи.
 
-4. Сохраняет результат в подпапку:
-   /Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/ОЗВУЧКА
+4. Сохраняет результат в папку:
+   /Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/СКРИПТ ОЗВУЧКИ
+   (именно отсюда следующий скрипт — psych_prompt_pipeline_v2 — берёт озвучки,
+   поэтому папки должны совпадать: scenario_ru.mp3 / scenario_pl.mp3 / scenario_de.mp3)
 
 5. Работает через актуальный Voicer API (OAS 3.1, версия 1.1.0):
      POST /tasks                     -> TaskCreateResponse { task_id, message }
@@ -65,7 +67,10 @@ BACKUP_BASE_URL = "https://voiceapiru.csv666.ru"
 # Папка с исходными текстами и папка для готовой озвучки.
 BASE_DIR = Path("/Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША")
 SCENARIOS_DIR = BASE_DIR / "СЦЕНАРИИ"
-OUTPUT_DIR = BASE_DIR / "ОЗВУЧКА"
+# ВАЖНО: сюда же смотрит следующий скрипт (psych_prompt_pipeline_v2 ->
+# DEFAULT_VOICEOVER_FOLDER). Папки обязаны совпадать, иначе пайплайн возьмёт
+# не те (старые) озвучки. Имена файлов: scenario_ru.mp3 / scenario_pl.mp3 / scenario_de.mp3.
+OUTPUT_DIR = BASE_DIR / "СКРИПТ ОЗВУЧКИ"
 
 # UUID шаблона из API. Именно его голосом озвучиваются все файлы.
 # Голос / модель / движок / водяной знак / настройки берутся из шаблона.
