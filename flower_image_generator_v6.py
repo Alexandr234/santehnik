@@ -843,6 +843,88 @@ def generate_image(job: Job) -> dict:
 
 
 # =========================
+# SMOKE TEST — какая модель реально работает
+# =========================
+
+def probe_operation(operation: str, prompt: str, *, timeout: int = 120) -> Tuple[bool, str]:
+    """Одна генерация через указанную operation, БЕЗ бесконечных ретраев. (ok, detail)."""
+    url = normalize_api_base(BASE_URL) + V6_GENERATIONS_ENDPOINT
+    payload: Dict[str, Any] = {
+        "operation": operation,
+        "prompt": clean_prompt_text(prompt),
+        "aspect_ratio": _resolve_aspect_ratio(),
+    }
+    if operation == "grok_image_generate":
+        payload["quality"] = os.getenv("FAST_GEN_IMAGE_QUALITY", "speed").strip().lower() or "speed"
+    try:
+        r = requests.post(url, headers=headers(), json=payload, timeout=REQUEST_TIMEOUT)
+    except Exception as e:
+        return False, f"POST error: {e}"
+    if r.status_code != 200:
+        return False, f"HTTP {r.status_code}: {r.text[:200]}"
+    try:
+        gid = r.json().get("id")
+    except Exception:
+        return False, f"нет id в ответе: {r.text[:200]}"
+    if not gid:
+        return False, f"нет id в ответе: {r.text[:200]}"
+
+    status_url = normalize_api_base(BASE_URL) + V6_GENERATION_STATUS_ENDPOINT.format(generation_id=gid)
+    started = time.time()
+    while time.time() - started < timeout:
+        time.sleep(3)
+        try:
+            s = requests.get(status_url, headers=headers(json_content=False), timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            return False, f"GET error: {e}"
+        if s.status_code == 429:
+            continue
+        if s.status_code != 200:
+            return False, f"status HTTP {s.status_code}: {s.text[:200]}"
+        body = s.json()
+        st = body.get("status")
+        if st == "succeeded":
+            n = len(body.get("results") or [])
+            return True, f"succeeded, results={n}"
+        if st == "failed":
+            return False, f"failed: {body.get('error') or body}"
+    return False, f"timeout {timeout}s (последний статус не succeeded/failed)"
+
+
+def run_smoke_test(sample_prompt: str) -> None:
+    log("\n" + "=" * 50)
+    log("SMOKE TEST — по одной генерации на каждую модель")
+    log(f"Промпт: {sample_prompt[:80]}")
+    log("=" * 50)
+    ops = [
+        "flower_image_generate",
+        "nano_banana_2_image_generate",
+        "nano_banana_pro_image_generate",
+        "grok_image_generate",
+        "openai_image_generate",
+    ]
+    results: List[Tuple[str, bool, str]] = []
+    for op in ops:
+        log(f"\n-> {op} ...")
+        ok, detail = probe_operation(op, sample_prompt)
+        mark = "✅ OK" if ok else "❌ FAIL"
+        log(f"   {mark}: {detail}")
+        results.append((op, ok, detail))
+    log("\n" + "=" * 50)
+    log("ИТОГ:")
+    working = [op for op, ok, _ in results if ok]
+    for op, ok, detail in results:
+        log(f"  {'✅' if ok else '❌'} {op}")
+    if working:
+        log(f"\nРабочие модели: {', '.join(working)}")
+        log(f"Запускай так:  python3 flower_image_generator_v6.py --operation {working[0]}")
+    else:
+        log("\nНи одна модель не отдала картинку — проблема на стороне аккаунта/сервиса, "
+            "а не в скрипте. Проверь баланс кредитов и статус Fast-Gen.")
+    log("=" * 50)
+
+
+# =========================
 # GLOBAL SCHEDULING — один пул на все языки для максимума потоков
 # =========================
 
@@ -967,6 +1049,8 @@ def main() -> None:
     parser.add_argument("--poll-sec", type=int, default=OPERATION_POLL_SEC)
     parser.add_argument("--no-skip", action="store_true", help="Перегенерировать уже существующие")
     parser.add_argument("--dry-run", action="store_true", help="Показать промпты без API-вызовов")
+    parser.add_argument("--smoke-test", action="store_true",
+                        help="Прогнать по 1 генерации на каждую модель и показать, какая реально работает.")
     args = parser.parse_args()
 
     BASE_URL = normalize_api_base(args.api_base)
@@ -1028,6 +1112,13 @@ def main() -> None:
         return
 
     ensure_api_ready()
+
+    if args.smoke_test:
+        sample = next((it.prompt for _, items in jobs_by_lang for it in items),
+                      "a simple flat cartoon of a calm young man in an olive green hoodie")
+        run_smoke_test(sample)
+        return
+
     log(f"Fast-Gen V6{extra} | text-to-image, без персонажа | aspect_ratio={_resolve_aspect_ratio()}")
 
     # Максимум потоков.
