@@ -50,7 +50,7 @@ import json
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -208,15 +208,47 @@ class Step:
     script: Path
     # Функция готовности: (готово, пояснение) или None если проверить нельзя (всегда запускать).
     ready: Optional[Callable[[], Optional[tuple[bool, str]]]]
+    # Запасные имена файла в той же папке, если точного script нет (на случай другого названия).
+    alts: list[str] = field(default_factory=list)
+    # Шаблон поиска в той же папке, если ни script, ни alts не найдены.
+    glob: Optional[str] = None
 
 
 STEPS: list[Step] = [
-    Step("Озвучка RU/PL/DE",   BASE_DIR / "СКРИПТ ОЗВУЧКИ" / "voicer_batch_tts_RU_PL_DE.py", ready_voiceover),
-    Step("Генерация промптов", BASE_DIR / "ПРОМПТЫ" / "psych_prompt_pipeline_v2карлюнг.py",  ready_prompts),
-    Step("Карл Юнг",           BASE_DIR / "ПРОМПТЫ" / "КАРЛ ЮНГ.py",                          ready_karl_jung),
-    Step("Генерация картинок", BASE_DIR / "ВИЗУАЛ" / "flower_image_generator2юнг.py",         ready_images),
-    Step("Сборка видео",       BASE_DIR / "МОНТАЖ" / "video_creator_zoom15.py",               ready_video),
+    Step("Озвучка RU/PL/DE",   BASE_DIR / "СКРИПТ ОЗВУЧКИ" / "voicer_batch_tts_RU_PL_DE.py", ready_voiceover,
+         alts=["voicer_batch_tts_RU_PL_DE.py"], glob="voicer_batch_tts*.py"),
+    Step("Генерация промптов", BASE_DIR / "ПРОМПТЫ" / "psych_prompt_pipeline_v2карлюнг.py",  ready_prompts,
+         alts=["psych_prompt_pipeline_v2.py", "psych_prompt_pipeline_v2карлюнг.py"],
+         glob="psych_prompt_pipeline*.py"),
+    Step("Карл Юнг",           BASE_DIR / "ПРОМПТЫ" / "КАРЛ ЮНГ.py",                          ready_karl_jung,
+         glob="*ЮНГ*.py"),
+    Step("Генерация картинок", BASE_DIR / "ВИЗУАЛ" / "flower_image_generator2юнг.py",         ready_images,
+         glob="flower_image_generator*.py"),
+    Step("Сборка видео",       BASE_DIR / "МОНТАЖ" / "video_creator_zoom15.py",               ready_video,
+         glob="video_creator*.py"),
 ]
+
+
+def resolve_script(step: Step) -> Path:
+    """
+    Возвращает реальный путь к скрипту шага.
+    Порядок: точное имя -> запасные имена (alts) -> поиск по шаблону (glob).
+    Если ничего не найдено — возвращаем исходный путь (для понятного сообщения об ошибке).
+    """
+    if step.script.exists():
+        return step.script
+    folder = step.script.parent
+    for alt in step.alts:
+        cand = folder / alt
+        if cand.exists():
+            return cand
+    if step.glob:
+        hits = sorted(folder.glob(step.glob))
+        # Отбрасываем самого себя и служебные файлы на всякий случай.
+        hits = [h for h in hits if h.is_file()]
+        if hits:
+            return hits[0]
+    return step.script
 
 
 def log(message: str = "") -> None:
@@ -341,7 +373,8 @@ def main() -> None:
     if args.list:
         log("Шаги пайплайна и готовность результатов:")
         for i, step in enumerate(STEPS, start=1):
-            exists = "✓" if step.script.exists() else "✗ нет файла"
+            resolved = resolve_script(step)
+            exists = "✓" if resolved.exists() else "✗ нет файла"
             r = check_ready(step)
             if r is None:
                 status = "проверить нельзя → запуск всегда"
@@ -349,7 +382,7 @@ def main() -> None:
                 ready, detail = r
                 status = ("ГОТОВО → пропуск" if ready else "не готово → запуск") + f" ({detail})"
             log(f"  {i}. {step.name}  [{exists}]  {status}")
-            log(f"     {step.script}")
+            log(f"     {resolved}")
         return
 
     steps = select_steps(args)
@@ -392,7 +425,7 @@ def main() -> None:
                 skipped.append((number, step.name, r[1]))
                 continue
 
-        code = run_step(number, total, step.name, step.script)
+        code = run_step(number, total, step.name, resolve_script(step))
         ran += 1
         if code != 0:
             failures.append((number, step.name, code))
