@@ -3,6 +3,12 @@
 """
 Pipeline: RU / PL / DE voiceovers -> Whisper transcription -> visual blocks with timecodes -> image prompts.
 
+v3.3 (по умолчанию БЕЗ человека в кадре):
+  * Фигура человека теперь НЕ обязательна и по умолчанию ОТСУТСТВУЕТ. Большинство кадров — чистый
+    символический пейзаж/свет/объект (scene_type "pure_landscape", subject "no figure"). Человек
+    появляется лишь изредка, когда реплика прямо про присутствие человека, и тогда — крошечный
+    анонимный силуэт со спины. Дефолты, fallback-сцены и банк «событий без людей» переписаны под это.
+
 v3.2 (стиль под референсы, БЕЗ привязки к персонажу):
   * Фигура человека теперь НЕ повторяющийся герой: анонимный человек, со спины или силуэтом,
     маленький в кадре, БЕЗ узнаваемого лица, и его вид (телосложение/одежда/волосы) МЕНЯЕТСЯ
@@ -144,8 +150,8 @@ DEFAULT_VIDEO_THEME = (
     "a deep, contemplative psychology and philosophy video about the inner journey of a person: "
     "confronting fear and the unknown, personal transformation and rebirth, facing one's shadow, "
     "the search for meaning, and finding a hidden order within chaos. "
-    "The visuals are metaphorical and symbolic rather than literal — a lone anonymous human before "
-    "something vast and luminous."
+    "The visuals are metaphorical and symbolic rather than literal — usually vast luminous landscapes, "
+    "light and symbols with no person at all."
 )
 VIDEO_THEME = (os.getenv("VIDEO_THEME", "").strip() or DEFAULT_VIDEO_THEME)
 
@@ -283,6 +289,20 @@ ACTION_BANK = [
     "climbing toward a blazing light high above",
     "silhouetted on a ridge against a burning sky",
     "descending into deep warm shadow away from the light",
+]
+
+# «События» для кадров БЕЗ фигуры (чистый символический пейзаж/свет). Никаких людей.
+EVENT_BANK = [
+    "a vast sea of golden light glowing beneath a burning crimson sky",
+    "colossal god-ray beams of light falling through a deep blood-red sky",
+    "a radiant sun bursting over an endless golden horizon",
+    "a storm of swirling golden embers drifting through a dark void",
+    "a single narrow path of light cutting across vast darkness",
+    "towering cracked stone monoliths glowing in crimson and gold",
+    "molten golden waves rolling toward a distant red horizon",
+    "a colossal cosmic nebula of stars unfurling across the sky",
+    "a doorway of pure radiant light standing alone in darkness",
+    "hidden geometric order shimmering to life within swirling chaos",
 ]
 
 # Кадрирование — эпичные широкие планы, крошечная фигура в огромном кадре.
@@ -636,11 +656,13 @@ For each spoken line, design ONE powerful cinematic scene that visually and symb
 that line's meaning, grounded in the topic.
 
 RULES:
-- No consistent protagonist and no cartoon character. Any human is a single anonymous person, faceless,
-  small in the frame, usually seen from behind or as a silhouette; VARY their look (build, clothing, hair)
-  from scene to scene so NO recurring individual emerges. Never describe a recognizable face/identity.
-- Prefer symbolic metaphor over literal depiction (light, darkness, scale, thresholds, crowds, cosmos,
-  monoliths, storms, mirrors). Some scenes have NO figure — a pure landscape (scene_type "pure_landscape").
+- DEFAULT TO NO HUMAN FIGURE. Most scenes are pure symbolic landscapes / objects / light with NO person at
+  all (scene_type "pure_landscape"); set subject to "no figure" unless a human is truly essential.
+- A human is OPTIONAL and rare — include one only when the line is genuinely about a human presence, and then
+  only as a tiny anonymous person seen from behind or as a silhouette, no recognizable face, varied between
+  scenes; never a recurring character or cartoon character.
+- Express ideas through symbolic metaphor (light, darkness, scale, thresholds, cosmos, monoliths, storms,
+  mirrors, a burning horizon), not through a person.
 - CHANGE the scene dramatically line to line: vary environment, scale, symbol, composition.
 - Crowds only when the line is about people/society/the masses; else "none". A strong symbol only when it helps; else "no symbol".
 - Majestic mood, few but powerful elements. Never photographic, never cartoon, never modern clutter.
@@ -693,17 +715,18 @@ CAMERA OPTIONS (framing only, not content): {json.dumps(cam_pool)}
 BLOCKS:
 {json.dumps(build_blocks_payload(blocks), ensure_ascii=False)}
 
-For each block output ONE item. From current_text's meaning, decide the most powerful epic visual metaphor
-(a lone figure before the sublime, a crowd, a threshold of light, a cosmic giant, a storm of embers,
-a shattered mirror, a path of light through darkness, a burning horizon...). A human figure is OPTIONAL
-and always anonymous/faceless — prefer "no figure" when a pure landscape says it better.
+For each block output ONE item. From current_text's meaning, decide the most powerful epic visual metaphor —
+usually a pure symbolic landscape / light / object with NO person (a threshold of light, a cosmic nebula,
+a storm of embers, a shattered mirror, a path of light through darkness, a burning horizon, towering monoliths...).
+DEFAULT TO "no figure". Add a human only rarely, when the line is truly about a human presence, and then only
+as a tiny anonymous silhouette from behind (varied, never a recurring character).
 Each scene must make the idea readable without sound, as an epic painterly image in golden and crimson light.
 
-Return JSON: {{"items": [{{"index": <int>, "scene_type": "<one scene type>", "subject": "<what is in frame; anonymous faceless silhouette, or 'no figure'>", "crowd": "<faceless crowd + what it does, or 'none'>", "symbol": "<one powerful symbol, or 'no symbol'>", "environment": "<concrete epic symbolic setting fitting the line>", "action": "<the core visible event>", "emotion": "<dominant mood>", "camera_framing": "<epic wide framing>", "reason": "<one sentence>"}}]}}
+Return JSON: {{"items": [{{"index": <int>, "scene_type": "<one scene type>", "subject": "usually 'no figure'; only if truly needed, a tiny anonymous silhouette from behind", "crowd": "<faceless crowd + what it does, or 'none'>", "symbol": "<one powerful symbol, or 'no symbol'>", "environment": "<concrete epic symbolic setting fitting the line>", "action": "<the core visible event>", "emotion": "<dominant mood>", "camera_framing": "<epic wide framing>", "reason": "<one sentence>"}}]}}
 
-Rules: exactly one item per block; all English; 4-14 words per field. subject is a single anonymous, faceless
-person seen from behind or as a silhouette — VARY their look each scene, never a recurring character, no
-recognizable face — or "no figure". Illustrate the SPECIFIC current_text as an epic metaphor.
+Rules: exactly one item per block; all English; 4-14 words per field. subject defaults to "no figure"; include
+a person only rarely and then as a tiny anonymous silhouette from behind (varied each scene, never a recurring
+character, no recognizable face). Illustrate the SPECIFIC current_text as an epic metaphor.
 Vary setting/scale/symbol across scenes; keep every frame monumental and painterly. Crowds = vast faceless
 silhouettes, only when the line is about people/society else "none". Symbol only if it truly helps else "no symbol".
 Never photographic, cartoon, or cluttered.
@@ -772,27 +795,29 @@ def build_final_prompt(scene: dict) -> str:
 def normalize_scene(raw: dict, b: VisualBlock, recent: list[dict], salt: int) -> dict:
     """ДОВЕРЯЕМ модели. Берём её поля как есть; банк используется только если поле
     пустое или явно generic. Никакого постоянного персонажа — фигура анонимна/опциональна."""
-    scene_type = clean_text(raw.get("scene_type", "")) or "figure_before_vastness"
+    scene_type = clean_text(raw.get("scene_type", "")) or "pure_landscape"
     if scene_type not in SCENE_TYPES:
-        scene_type = "figure_before_vastness"
+        scene_type = "pure_landscape"
 
     environment = clean_text(raw.get("environment", ""))
     if not environment or is_generic(environment, GENERIC_ENV_PATTERNS):
         environment = pick_fallback(ENVIRONMENT_BANK, recent, "environment", MAX_SAME_ENV_IN_RECENT, salt)
 
+    # subject: по умолчанию фигуры НЕТ. Человек появляется, только если модель его явно описала.
+    subject = clean_text(raw.get("subject", ""))
+    if subject.lower() in {"", "no figure", "none", "no person", "nobody", "no one", "empty"}:
+        subject = "no figure"
+    no_figure = subject == "no figure"
+
     action = clean_text(raw.get("action", ""))
     if not action or is_generic(action, GENERIC_ACT_PATTERNS):
-        action = pick_fallback(ACTION_BANK, recent, "action", 2, salt + 1)
+        # без фигуры берём «событие пейзажа», с фигурой — действие человека
+        action = pick_fallback(EVENT_BANK if no_figure else ACTION_BANK, recent, "action", 2, salt + 1)
 
     emotion = clean_text(raw.get("emotion", "")) or pick_fallback(EMOTION_BANK, recent, "emotion", 3, salt + 2)
 
     camera = clean_text(raw.get("camera_framing", "")) or \
-        DEFAULT_CAMERA_BY_TYPE.get(scene_type, "extreme wide shot, tiny lone figure low in a huge frame")
-
-    # subject: anonymous figure or explicit "no figure" for pure landscapes.
-    subject = clean_text(raw.get("subject", ""))
-    if not subject:
-        subject = "no figure" if scene_type == "pure_landscape" else "a lone anonymous silhouette"
+        DEFAULT_CAMERA_BY_TYPE.get(scene_type, "sweeping epic wide shot with deep atmospheric distance")
 
     # accept crowd from "crowd" or legacy "others" field
     crowd = clean_text(raw.get("crowd", "")) or clean_text(raw.get("others", ""))
@@ -816,27 +841,28 @@ def normalize_scene(raw: dict, b: VisualBlock, recent: list[dict], salt: int) ->
     }
 
 
+# Запасные сцены — ВСЕ без фигуры (чистый символический пейзаж/свет).
 FALLBACK_SCENES = [
-    {"scene_type": "figure_before_vastness", "subject": "a lone anonymous silhouette seen from behind",
+    {"scene_type": "pure_landscape", "subject": "no figure",
      "crowd": "none", "symbol": "a radiant sun bursting over the horizon",
-     "environment": "the edge of a towering red cliff overlooking an endless glowing golden sea at sunrise",
-     "action": "standing alone at the very edge, facing the vast glowing light",
-     "emotion": "awe and reverence", "camera_framing": "extreme wide shot, tiny figure low in a huge frame, seen from behind"},
-    {"scene_type": "the_crowd", "subject": "a vast sea of faceless dark silhouettes",
-     "crowd": "an endless anonymous crowd stretching to the horizon", "symbol": "no symbol",
-     "environment": "an immense crowd of faceless silhouettes stretching to the horizon under a red sky",
-     "action": "an ocean of silhouettes facing a distant burning light",
-     "emotion": "overwhelmed insignificance", "camera_framing": "vast high wide shot over an endless crowd of silhouettes"},
-    {"scene_type": "cosmic_or_giant", "subject": "a tiny anonymous figure beneath a colossal cosmic being",
-     "crowd": "none", "symbol": "a swirling galaxy or cosmic spiral",
-     "environment": "a colossal cosmic giant made of nebulae and stars looming over a tiny figure",
-     "action": "gazing up at a towering cosmic figure of stars",
-     "emotion": "the sublime", "camera_framing": "low-angle wide shot looking up at the towering cosmic figure"},
-    {"scene_type": "threshold_or_choice", "subject": "a small silhouette before doorways of light",
+     "environment": "a vast luminous plain stretching to a blazing sun on the horizon",
+     "action": "a radiant sun bursting over an endless golden horizon",
+     "emotion": "awe and reverence", "camera_framing": "sweeping epic wide landscape shot, no figure"},
+    {"scene_type": "symbolic_metaphor", "subject": "no figure",
      "crowd": "none", "symbol": "a doorway of pure light in darkness",
      "environment": "a row of monumental doorways of light standing in darkness",
-     "action": "stepping through a glowing threshold into the unknown",
-     "emotion": "solemn transformation", "camera_framing": "wide symmetrical shot, figure centered before the threshold"},
+     "action": "a doorway of pure radiant light standing alone in darkness",
+     "emotion": "solemn transformation", "camera_framing": "centered wide shot, the glowing symbol dominating the frame"},
+    {"scene_type": "symbolic_metaphor", "subject": "no figure",
+     "crowd": "none", "symbol": "a swirling galaxy or cosmic spiral",
+     "environment": "a colossal cosmic nebula of stars unfurling across a golden sky",
+     "action": "a colossal cosmic nebula of stars unfurling across the sky",
+     "emotion": "the sublime", "camera_framing": "sweeping epic wide landscape shot with deep atmospheric distance"},
+    {"scene_type": "inner_storm", "subject": "no figure",
+     "crowd": "none", "symbol": "a lone flame or ember rising",
+     "environment": "a storm of swirling golden embers and sparks in a dark void",
+     "action": "a storm of swirling golden embers drifting through a dark void",
+     "emotion": "profound stillness", "camera_framing": "sweeping epic wide landscape shot with deep atmospheric distance"},
 ]
 
 
