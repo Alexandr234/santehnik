@@ -50,6 +50,7 @@ import base64
 import csv
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -128,10 +129,17 @@ OPERATION_TIMEOUT_SEC = int(os.getenv("FAST_GEN_OPERATION_TIMEOUT_SEC", "1800"))
 RETRY_DELAY_SEC = int(os.getenv("FAST_GEN_RETRY_DELAY_SEC", "8"))
 MAX_RETRIES = int(os.getenv("FAST_GEN_MAX_RETRIES", "0"))  # 0 = бесконечно для НЕфатальных ошибок
 
+# 429 concurrency: короткий джиттер-бэкофф, чтобы воркеры не долбили синхронно.
+RATE_LIMIT_RETRY_MIN = float(os.getenv("FAST_GEN_RATE_LIMIT_MIN", "2"))
+RATE_LIMIT_RETRY_MAX = float(os.getenv("FAST_GEN_RATE_LIMIT_MAX", "7"))
+
 # "auto" => взять лимит из /api/v6/usage. Иначе фиксированное число.
 _WORKERS_RAW = os.getenv("FAST_GEN_IMAGE_WORKERS", "").strip()
 MAX_IMAGE_WORKERS: str | int = int(_WORKERS_RAW) if _WORKERS_RAW.isdigit() and int(_WORKERS_RAW) > 0 else "auto"
 
+# Запас по слотам: держим workers НИЖЕ лимита конкурентности, иначе на submit
+# постоянно ловим 429 из-за гонки "слот освобождён, но ещё не разрегистрирован".
+CONCURRENCY_MARGIN = int(os.getenv("FAST_GEN_CONCURRENCY_MARGIN", "2"))
 # Верхний потолок на случай, если API вернёт странно большое число потоков.
 WORKERS_HARD_CAP = int(os.getenv("FAST_GEN_WORKERS_HARD_CAP", "64"))
 # Фолбэк, если usage недоступен или вернул 0.
@@ -433,6 +441,25 @@ def should_retry(attempt: int) -> bool:
     return MAX_RETRIES <= 0 or attempt < MAX_RETRIES
 
 
+def retry_delay() -> float:
+    """Джиттер для обычных ретраев, чтобы воркеры не били синхронно."""
+    return RETRY_DELAY_SEC + random.uniform(0, min(4.0, float(RETRY_DELAY_SEC)))
+
+
+def rate_limit_delay(attempt: int) -> float:
+    """Короткий бэкофф с джиттером для 429 concurrency."""
+    hi = min(RATE_LIMIT_RETRY_MAX, RATE_LIMIT_RETRY_MIN * (1.0 + 0.5 * (attempt - 1)))
+    return random.uniform(RATE_LIMIT_RETRY_MIN, max(RATE_LIMIT_RETRY_MIN, hi))
+
+
+def short_429(resp: requests.Response) -> str:
+    try:
+        j = resp.json()
+        return str(j.get("error") or j.get("code") or "rate_limit")
+    except Exception:
+        return "rate_limit"
+
+
 def _safe_payload_for_log(payload: dict) -> dict:
     safe = dict(payload)
     if isinstance(safe.get("prompt"), str) and len(safe["prompt"]) > 220:
@@ -459,6 +486,14 @@ def post_json(endpoint: str, payload: dict, *, label: str) -> dict:
         attempt += 1
         try:
             resp = requests.post(url, headers=headers(), json=payload, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 429:
+                if not should_retry(attempt):
+                    raise RuntimeError(f"{label}: HTTP 429: {short_429(resp)}")
+                delay = rate_limit_delay(attempt)
+                if attempt == 1 or attempt % 10 == 0:
+                    log(f"[WAIT] {label}: 429 ({short_429(resp)}) — жду слот, retry #{attempt} in {delay:.1f}s")
+                time.sleep(delay)
+                continue
             if resp.status_code in FATAL_STATUSES:
                 raise FatalApiError(
                     f"{label}: HTTP {resp.status_code}: {resp.text}\n"
@@ -473,8 +508,9 @@ def post_json(endpoint: str, payload: dict, *, label: str) -> dict:
         except Exception as e:
             if not should_retry(attempt):
                 raise
-            log(f"[WARN] {label}: attempt {attempt} failed: {e}, retry in {RETRY_DELAY_SEC}s...")
-            time.sleep(RETRY_DELAY_SEC)
+            delay = retry_delay()
+            log(f"[WARN] {label}: attempt {attempt} failed: {e}, retry in {delay:.1f}s...")
+            time.sleep(delay)
 
 
 def get_json(endpoint: str, *, label: str, params: Optional[dict] = None) -> dict:
@@ -486,6 +522,11 @@ def get_json(endpoint: str, *, label: str, params: Optional[dict] = None) -> dic
         attempt += 1
         try:
             resp = requests.get(url, headers=headers(json_content=False), params=params, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 429:
+                if not should_retry(attempt):
+                    raise RuntimeError(f"{label}: HTTP 429: {short_429(resp)}")
+                time.sleep(rate_limit_delay(attempt))
+                continue
             if resp.status_code in FATAL_STATUSES:
                 raise FatalApiError(f"{label}: HTTP {resp.status_code}: {resp.text}\nURL: {url}")
             if resp.status_code >= 400:
@@ -496,8 +537,9 @@ def get_json(endpoint: str, *, label: str, params: Optional[dict] = None) -> dic
         except Exception as e:
             if not should_retry(attempt):
                 raise
-            log(f"[WARN] {label}: attempt {attempt} failed: {e}, retry in {RETRY_DELAY_SEC}s...")
-            time.sleep(RETRY_DELAY_SEC)
+            delay = retry_delay()
+            log(f"[WARN] {label}: attempt {attempt} failed: {e}, retry in {delay:.1f}s...")
+            time.sleep(delay)
 
 
 def download_file(url: str, path: Path, *, label: str, use_api_key: bool = True) -> None:
@@ -570,8 +612,10 @@ def resolve_workers(requested: str | int) -> int:
             workers = WORKERS_FALLBACK
             log(f"[THREADS] лимит из API неизвестен -> fallback {workers}")
         else:
-            workers = limit
-            log(f"[THREADS] авто из /api/v6/usage: {workers}")
+            # Держим запас ниже лимита конкурентности, чтобы submit не ловил 429
+            # из-за гонки освобождения слота.
+            workers = max(1, limit - CONCURRENCY_MARGIN)
+            log(f"[THREADS] авто из /api/v6/usage: limit={limit}, margin={CONCURRENCY_MARGIN} -> workers={workers}")
     workers = max(1, min(workers, WORKERS_HARD_CAP))
     return workers
 
@@ -779,8 +823,9 @@ def generate_image(job: Job) -> dict:
         except Exception as e:
             if not should_retry(attempt):
                 raise
-            log(f"[ERROR] [{locale}] #{item.index}: {e}, retry in {RETRY_DELAY_SEC}s...")
-            time.sleep(RETRY_DELAY_SEC)
+            delay = retry_delay()
+            log(f"[ERROR] [{locale}] #{item.index}: {e}, retry in {delay:.1f}s...")
+            time.sleep(delay)
 
 
 # =========================
