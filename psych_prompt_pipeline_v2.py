@@ -3,6 +3,12 @@
 """
 Pipeline: RU / PL / DE voiceovers -> Whisper transcription -> visual blocks with timecodes -> image prompts.
 
+v3.4 (без жёсткости — модель решает сама):
+  * Эпичный живописный стиль (золото/багрянец) ОСТАЁТСЯ подсказкой в промпте, но убраны жёсткие
+    правила и форс. Модель сама решает сцену и нужен ли человек: если реплика про человека — добавит
+    анонимную фигуру (со спины/силуэтом), если нет — чистый символический пейзаж/свет. Никакого
+    «по умолчанию без человека» и никакого фиксированного списка scene_type.
+
 v3.3 (по умолчанию БЕЗ человека в кадре):
   * Фигура человека теперь НЕ обязательна и по умолчанию ОТСУТСТВУЕТ. Большинство кадров — чистый
     символический пейзаж/свет/объект (scene_type "pure_landscape", subject "no figure"). Человек
@@ -150,8 +156,8 @@ DEFAULT_VIDEO_THEME = (
     "a deep, contemplative psychology and philosophy video about the inner journey of a person: "
     "confronting fear and the unknown, personal transformation and rebirth, facing one's shadow, "
     "the search for meaning, and finding a hidden order within chaos. "
-    "The visuals are metaphorical and symbolic rather than literal — usually vast luminous landscapes, "
-    "light and symbols with no person at all."
+    "The visuals are metaphorical and symbolic rather than literal — luminous landscapes, light and "
+    "symbols, with a human figure only when a line truly calls for one."
 )
 VIDEO_THEME = (os.getenv("VIDEO_THEME", "").strip() or DEFAULT_VIDEO_THEME)
 
@@ -649,23 +655,17 @@ deep-red light. This is metaphorical art, NOT literal illustration.
 
 VIDEO TOPIC (pick relevant symbols/settings from it): {VIDEO_THEME}
 ART STYLE (fixed, added automatically — do NOT restate): {ART_STYLE}
-HUMAN FIGURES (NO fixed recurring character): {FIGURE_STYLE}
+HUMAN FIGURES (only when the scene needs one): {FIGURE_STYLE}
 CROWDS: {CROWD_STYLE}
 
-For each spoken line, design ONE powerful cinematic scene that visually and symbolically communicates
-that line's meaning, grounded in the topic.
+For each spoken line, design ONE powerful cinematic scene that symbolically communicates its meaning,
+grounded in the topic. YOU decide the scene freely.
 
-RULES:
-- DEFAULT TO NO HUMAN FIGURE. Most scenes are pure symbolic landscapes / objects / light with NO person at
-  all (scene_type "pure_landscape"); set subject to "no figure" unless a human is truly essential.
-- A human is OPTIONAL and rare — include one only when the line is genuinely about a human presence, and then
-  only as a tiny anonymous person seen from behind or as a silhouette, no recognizable face, varied between
-  scenes; never a recurring character or cartoon character.
-- Express ideas through symbolic metaphor (light, darkness, scale, thresholds, cosmos, monoliths, storms,
-  mirrors, a burning horizon), not through a person.
-- CHANGE the scene dramatically line to line: vary environment, scale, symbol, composition.
-- Crowds only when the line is about people/society/the masses; else "none". A strong symbol only when it helps; else "no symbol".
-- Majestic mood, few but powerful elements. Never photographic, never cartoon, never modern clutter.
+- Decide from the line whether a human belongs in the frame: include one when the line is about a person,
+  otherwise use a pure symbolic landscape / light / object with no one. Both are equally welcome.
+- When a human appears, keep it anonymous (from behind or a silhouette, no recognizable face) and not a
+  recurring character. Use a crowd only when the line is about people/society; a symbol only when it helps.
+- Change the scene from line to line; keep it majestic and painterly, never photographic or cartoon.
 
 Return JSON only, no prose. Describe ONLY scene content (what/who is in frame, setting, symbol, composition).
 """.strip()
@@ -708,28 +708,23 @@ def generate_batch(
 LANGUAGE: {lang_name} ({lang_code}). All scene fields in English; the voiceover text is in {lang_name}.
 VIDEO TOPIC: {VIDEO_THEME}
 
-SCENE TYPES: {SCENE_TYPE_REFERENCE}
+SCENE TYPES (optional hints — pick freely or invent your own): {SCENE_TYPE_REFERENCE}
 RECENT SCENES (make the next ones visually different, esp. SETTING and SYMBOL): {json.dumps(recent_compact, ensure_ascii=False)}
 CAMERA OPTIONS (framing only, not content): {json.dumps(cam_pool)}
 
 BLOCKS:
 {json.dumps(build_blocks_payload(blocks), ensure_ascii=False)}
 
-For each block output ONE item. From current_text's meaning, decide the most powerful epic visual metaphor —
-usually a pure symbolic landscape / light / object with NO person (a threshold of light, a cosmic nebula,
-a storm of embers, a shattered mirror, a path of light through darkness, a burning horizon, towering monoliths...).
-DEFAULT TO "no figure". Add a human only rarely, when the line is truly about a human presence, and then only
-as a tiny anonymous silhouette from behind (varied, never a recurring character).
-Each scene must make the idea readable without sound, as an epic painterly image in golden and crimson light.
+For each block output ONE item that symbolically conveys current_text as an epic painterly image in golden
+and crimson light. YOU choose the scene freely. Decide from the line whether a human belongs: include an
+anonymous person (from behind / as a silhouette) when the line is about a person, otherwise a pure landscape
+/ light / symbol with no one — whatever fits best. If watched without sound, the idea should read.
 
-Return JSON: {{"items": [{{"index": <int>, "scene_type": "<one scene type>", "subject": "usually 'no figure'; only if truly needed, a tiny anonymous silhouette from behind", "crowd": "<faceless crowd + what it does, or 'none'>", "symbol": "<one powerful symbol, or 'no symbol'>", "environment": "<concrete epic symbolic setting fitting the line>", "action": "<the core visible event>", "emotion": "<dominant mood>", "camera_framing": "<epic wide framing>", "reason": "<one sentence>"}}]}}
+Return JSON: {{"items": [{{"index": <int>, "scene_type": "<a short scene type>", "subject": "<what is in frame; an anonymous person from behind, or 'no figure'>", "crowd": "<faceless crowd + what it does, or 'none'>", "symbol": "<one symbol, or 'no symbol'>", "environment": "<the setting>", "action": "<the core visible event>", "emotion": "<dominant mood>", "camera_framing": "<epic wide framing>", "reason": "<one sentence>"}}]}}
 
-Rules: exactly one item per block; all English; 4-14 words per field. subject defaults to "no figure"; include
-a person only rarely and then as a tiny anonymous silhouette from behind (varied each scene, never a recurring
-character, no recognizable face). Illustrate the SPECIFIC current_text as an epic metaphor.
-Vary setting/scale/symbol across scenes; keep every frame monumental and painterly. Crowds = vast faceless
-silhouettes, only when the line is about people/society else "none". Symbol only if it truly helps else "no symbol".
-Never photographic, cartoon, or cluttered.
+Rules: one item per block; all English; concise (4-14 words per field). Add a human only when the line calls
+for one, and then keep it anonymous (from behind / silhouette, no recognizable face, not a recurring character);
+otherwise "no figure". Crowds only when the line is about people/society, else "none"; symbol only if it helps.
 """.strip()
 
     response = api_call(
@@ -795,9 +790,8 @@ def build_final_prompt(scene: dict) -> str:
 def normalize_scene(raw: dict, b: VisualBlock, recent: list[dict], salt: int) -> dict:
     """ДОВЕРЯЕМ модели. Берём её поля как есть; банк используется только если поле
     пустое или явно generic. Никакого постоянного персонажа — фигура анонимна/опциональна."""
-    scene_type = clean_text(raw.get("scene_type", "")) or "pure_landscape"
-    if scene_type not in SCENE_TYPES:
-        scene_type = "pure_landscape"
+    # Не навязываем фиксированный список — берём scene_type модели как есть (свободно).
+    scene_type = clean_text(raw.get("scene_type", "")) or "scene"
 
     environment = clean_text(raw.get("environment", ""))
     if not environment or is_generic(environment, GENERIC_ENV_PATTERNS):
