@@ -3,6 +3,14 @@
 """
 Pipeline: RU / PL / DE voiceovers -> Whisper transcription -> visual blocks with timecodes -> image prompts.
 
+v3.2 (стиль под референсы, БЕЗ привязки к персонажу):
+  * Фигура человека теперь НЕ повторяющийся герой: анонимный человек, со спины или силуэтом,
+    маленький в кадре, БЕЗ узнаваемого лица, и его вид (телосложение/одежда/волосы) МЕНЯЕТСЯ
+    от сцены к сцене — никакого постоянного персонажа. Эпичный живописный стиль (золото+багрянец)
+    сохранён как на референс-кадрах.
+  * В NEGATIVE_SUFFIX добавлены запреты на крупный план лица/портрет/узнаваемое лицо/повторяющегося
+    персонажа — чтобы модель не «залипала» на одном герое.
+
 v3.1 (удешевление и ускорение генерации промптов):
   * Модель по умолчанию — gpt-4o-mini (была дорогая gpt-5.4). Переопределяется env PROMPT_MODEL.
   * Системный и пользовательский промпты сжаты — заметно меньше входных токенов на каждый вызов.
@@ -146,9 +154,11 @@ VIDEO_THEME = (os.getenv("VIDEO_THEME", "").strip() or DEFAULT_VIDEO_THEME)
 #   export FIGURE_DESC="..."
 # или флагом:  --figure "..."
 DEFAULT_FIGURE_STYLE = (
-    "any human figure is an anonymous everyperson — a small lone silhouette seen mostly from behind "
-    "or in dark contour, without a recognizable face or identifying features, dwarfed by the immense "
-    "glowing scene, painted in the same epic oil-painting style; there is NO fixed recurring character"
+    "if a human appears, it is a SINGLE anonymous person shown small in the vast scene, almost always "
+    "seen from behind or as a dark rim-lit silhouette against the light, with NO visible or recognizable "
+    "face and only simple generic clothing; their build, clothing colour and hair may DIFFER from scene "
+    "to scene — this is NEVER the same recurring individual, NOT a consistent named protagonist and never "
+    "a cartoon character, always painted in the same epic oil-painting style"
 )
 FIGURE_STYLE = (os.getenv("FIGURE_DESC", "").strip() or DEFAULT_FIGURE_STYLE)
 
@@ -162,6 +172,7 @@ CROWD_STYLE = (
 # so we only forbid photographic realism, 3d renders, and any text/logos.
 NEGATIVE_SUFFIX = (
     "no photorealism, no realistic photograph, no 3d render, no cartoon, no flat vector, no anime, "
+    "no close-up face, no portrait, no recognizable facial features, no recurring named character, "
     "no text, no captions, no subtitles, no watermark, no logo, no signature, no modern clutter"
 )
 
@@ -625,8 +636,9 @@ For each spoken line, design ONE powerful cinematic scene that visually and symb
 that line's meaning, grounded in the topic.
 
 RULES:
-- No consistent protagonist; never describe a face/hair/clothes/identity. Any human = anonymous, faceless,
-  small silhouette (often from behind).
+- No consistent protagonist and no cartoon character. Any human is a single anonymous person, faceless,
+  small in the frame, usually seen from behind or as a silhouette; VARY their look (build, clothing, hair)
+  from scene to scene so NO recurring individual emerges. Never describe a recognizable face/identity.
 - Prefer symbolic metaphor over literal depiction (light, darkness, scale, thresholds, crowds, cosmos,
   monoliths, storms, mirrors). Some scenes have NO figure — a pure landscape (scene_type "pure_landscape").
 - CHANGE the scene dramatically line to line: vary environment, scale, symbol, composition.
@@ -689,8 +701,9 @@ Each scene must make the idea readable without sound, as an epic painterly image
 
 Return JSON: {{"items": [{{"index": <int>, "scene_type": "<one scene type>", "subject": "<what is in frame; anonymous faceless silhouette, or 'no figure'>", "crowd": "<faceless crowd + what it does, or 'none'>", "symbol": "<one powerful symbol, or 'no symbol'>", "environment": "<concrete epic symbolic setting fitting the line>", "action": "<the core visible event>", "emotion": "<dominant mood>", "camera_framing": "<epic wide framing>", "reason": "<one sentence>"}}]}}
 
-Rules: exactly one item per block; all English; 4-14 words per field. subject is anonymous/faceless (never a
-named character, no clothing/face) or "no figure". Illustrate the SPECIFIC current_text as an epic metaphor.
+Rules: exactly one item per block; all English; 4-14 words per field. subject is a single anonymous, faceless
+person seen from behind or as a silhouette — VARY their look each scene, never a recurring character, no
+recognizable face — or "no figure". Illustrate the SPECIFIC current_text as an epic metaphor.
 Vary setting/scale/symbol across scenes; keep every frame monumental and painterly. Crowds = vast faceless
 silhouettes, only when the line is about people/society else "none". Symbol only if it truly helps else "no symbol".
 Never photographic, cartoon, or cluttered.
