@@ -26,7 +26,8 @@ v3 changes (по сравнению с v2):
     драматический свет, сюрреалистичный символизм, ощущение благоговения.
 
 Default folders:
-    Voiceovers:  /Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/СКРИПТ ОЗВУЧКИ
+    Voiceovers:  /Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/ОЗВУЧКА
+                 (файлы: scenario_ru.mp3, scenario_pl.mp3, scenario_de.mp3)
     Output:      /Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/ПРОМПТЫ
 
 Install:
@@ -63,7 +64,7 @@ from openai import OpenAI, APIConnectionError, APITimeoutError, RateLimitError, 
 # ============================================================
 # 1) PATHS & API
 # ============================================================
-DEFAULT_VOICEOVER_FOLDER = "/Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/СКРИПТ ОЗВУЧКИ"
+DEFAULT_VOICEOVER_FOLDER = "/Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/ОЗВУЧКА"
 DEFAULT_PROMPTS_FOLDER   = "/Users/aleksandrtomilov/Desktop/ПСИХОЛОГИЯ ГЕРМАНИЯ ПОЛЬША/ПРОМПТЫ"
 
 # Вставь ключ сюда или задай переменную окружения OPENAI_API_KEY
