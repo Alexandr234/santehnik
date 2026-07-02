@@ -144,6 +144,14 @@ CONCURRENCY_MARGIN = int(os.getenv("FAST_GEN_CONCURRENCY_MARGIN", "2"))
 WORKERS_HARD_CAP = int(os.getenv("FAST_GEN_WORKERS_HARD_CAP", "64"))
 # Фолбэк, если usage недоступен или вернул 0.
 WORKERS_FALLBACK = int(os.getenv("FAST_GEN_WORKERS_FALLBACK", "4"))
+# ВАЖНО: дешёвые провайдеры (flower) физически не тянут десятки одновременных
+# генераций и возвращают "Generation failed" на всё. Поэтому режим 'auto'
+# держит СКРОМНУЮ конкурентность, которая реально генерит. Полный лимит аккаунта
+# включается явно через --workers max (на свой риск).
+AUTO_WORKERS = int(os.getenv("FAST_GEN_AUTO_WORKERS", "6"))
+# Сколько раз повторять генерацию, упавшую на стороне сервера ("try again later"),
+# прежде чем сдаться по этому промпту (0 = бесконечно).
+GEN_FAIL_MAX_RETRIES = int(os.getenv("FAST_GEN_GEN_FAIL_MAX_RETRIES", "6"))
 
 SKIP_EXISTING = True
 
@@ -608,14 +616,16 @@ def resolve_workers(requested: str | int) -> int:
         log(f"[THREADS] задано вручную: {workers}")
     else:
         limit = fetch_image_thread_limit()
-        if limit is None:
-            workers = WORKERS_FALLBACK
-            log(f"[THREADS] лимит из API неизвестен -> fallback {workers}")
-        else:
-            # Держим запас ниже лимита конкурентности, чтобы submit не ловил 429
-            # из-за гонки освобождения слота.
-            workers = max(1, limit - CONCURRENCY_MARGIN)
-            log(f"[THREADS] авто из /api/v6/usage: limit={limit}, margin={CONCURRENCY_MARGIN} -> workers={workers}")
+        # Полный лимит аккаунта минус запас на гонку освобождения слота.
+        full = max(1, (limit - CONCURRENCY_MARGIN)) if limit else WORKERS_FALLBACK
+        if requested == "max":
+            workers = full
+            log(f"[THREADS] MAX: limit={limit}, margin={CONCURRENCY_MARGIN} -> workers={workers} "
+                f"(осторожно: дешёвые модели могут массово падать)")
+        else:  # 'auto' — скромно и надёжно
+            workers = min(full, AUTO_WORKERS)
+            log(f"[THREADS] AUTO: limit={limit} -> workers={workers} "
+                f"(для полного лимита используй --workers max)")
     workers = max(1, min(workers, WORKERS_HARD_CAP))
     return workers
 
@@ -821,10 +831,14 @@ def generate_image(job: Job) -> dict:
         except (KeyboardInterrupt, FatalApiError):
             raise
         except Exception as e:
-            if not should_retry(attempt):
+            # Транзиентные server-side падения ("Generation failed, please try
+            # again later") повторяем, но не бесконечно — иначе один битый промпт
+            # держит поток вечно.
+            if GEN_FAIL_MAX_RETRIES > 0 and attempt >= GEN_FAIL_MAX_RETRIES:
+                log(f"[GIVE-UP] [{locale}] #{item.index}: {e} (после {attempt} попыток)")
                 raise
-            delay = retry_delay()
-            log(f"[ERROR] [{locale}] #{item.index}: {e}, retry in {delay:.1f}s...")
+            delay = min(60.0, retry_delay() * (1.5 ** (attempt - 1)))
+            log(f"[ERROR] [{locale}] #{item.index}: {e}, retry {attempt} in {delay:.1f}s...")
             time.sleep(delay)
 
 
@@ -906,11 +920,13 @@ def run_all(jobs: List[Job], workers: int, global_log: List[dict], log_lock: Loc
 
 def _parse_workers_arg(value: str) -> str | int:
     v = (value or "").strip().lower()
-    if v in {"auto", "max", ""}:
+    if v in {"auto", ""}:
         return "auto"
+    if v in {"max", "full"}:
+        return "max"
     if v.isdigit() and int(v) > 0:
         return int(v)
-    raise argparse.ArgumentTypeError("workers должно быть 'auto' или положительным числом")
+    raise argparse.ArgumentTypeError("workers должно быть 'auto', 'max' или положительным числом")
 
 
 def main() -> None:
@@ -945,7 +961,9 @@ def main() -> None:
     parser.add_argument("--aspect-ratio", default=ASPECT_RATIO,
                         help="Соотношение сторон n:n, например 16:9, 9:16, 1:1, 4:3, 3:4.")
     parser.add_argument("--workers", type=_parse_workers_arg, default=MAX_IMAGE_WORKERS,
-                        help="Число потоков: 'auto' = максимум из лимита аккаунта, или число. По умолчанию auto.")
+                        help="Потоки: 'auto' = скромно и надёжно (flower реально генерит), "
+                             "'max' = полный лимит аккаунта (дешёвые модели могут массово падать), "
+                             "или число. По умолчанию auto.")
     parser.add_argument("--poll-sec", type=int, default=OPERATION_POLL_SEC)
     parser.add_argument("--no-skip", action="store_true", help="Перегенерировать уже существующие")
     parser.add_argument("--dry-run", action="store_true", help="Показать промпты без API-вызовов")
