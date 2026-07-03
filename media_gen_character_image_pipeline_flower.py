@@ -130,10 +130,40 @@ class CharacterRef:
     alias: str
     storage_id: str
     filename: str
+    # Локальный путь к файлу персонажа — источник правды для перезагрузки в storage,
+    # когда storage id протух (TTL ~1 час с последнего использования).
+    path: Optional[str] = None
 
 
 class FatalApiError(RuntimeError):
     pass
+
+
+# Storage id референсов имеют TTL и в длинном параллельном прогоне протухают.
+# Обновляем их из локального файла по требованию, синхронизируя доступ к state
+# и не допуская дублирующих загрузок одного и того же персонажа.
+STATE_LOCK = Lock()
+_alias_locks_guard = Lock()
+_alias_locks: Dict[str, Lock] = {}
+
+
+def _alias_lock(alias: str) -> Lock:
+    with _alias_locks_guard:
+        lk = _alias_locks.get(alias)
+        if lk is None:
+            lk = Lock()
+            _alias_locks[alias] = lk
+        return lk
+
+
+def is_expired_reference_error(exc: Exception) -> bool:
+    """True, если ошибка про протухший/ненайденный референс в storage."""
+    msg = str(exc)
+    return (
+        "file_not_found_or_expired" in msg
+        or "not found or expired" in msg
+        or "не найден или истек" in msg
+    )
 
 
 # =========================
@@ -353,6 +383,42 @@ def upload_file_to_storage(image_path: Path) -> str:
     return validate_media_input(normalize_storage_id(str(storage_id)))
 
 
+def refresh_alias_storage_id(alias: str, state: dict, stale_id: Optional[str]) -> Optional[str]:
+    """
+    Перезагружает локальный файл персонажа в storage и возвращает свежий storage id.
+    Потокобезопасно: под per-alias локом; если другой поток уже обновил id — используем его.
+    """
+    lk = _alias_lock(alias)
+    with lk:
+        entry = state.get(alias) or {}
+        current = normalize_storage_id(entry.get("file_hash") or "")
+        stale = normalize_storage_id(stale_id or "")
+        if current and current != stale:
+            # Другой поток уже обновил референс — переиспользуем.
+            return current
+
+        # Путь из state, а если его нет (старый state) — детерминированный путь по alias.
+        path_str = entry.get("path")
+        p = Path(path_str) if path_str else character_output_path(alias)
+        if not p.exists():
+            log(f"[WARN] Локальный файл персонажа {alias} отсутствует: {p} — не могу обновить референс.")
+            return None
+
+        try:
+            new_id = upload_file_to_storage(p)
+        except Exception as e:
+            log(f"[WARN] Не удалось перезагрузить референс {alias}: {e}")
+            return None
+
+        entry["file_hash"] = new_id
+        entry["path"] = str(p)
+        with STATE_LOCK:
+            state[alias] = entry
+            save_json(STATE_FILE, state)
+        log(f"[INFO] Референс {alias} обновлён в storage: {new_id}")
+        return new_id
+
+
 def request_with_retries(url: str, payload: dict) -> dict:
     last_err: Optional[Exception] = None
     for attempt in range(1, RETRY_COUNT + 1):
@@ -423,19 +489,6 @@ def download_url_to_bytes(url: str) -> bytes:
     raise RuntimeError(f"Скачивание результата провалилось после {RETRY_COUNT} попыток: {last_err}")
 
 
-def result_storage_id(result_item: Dict[str, Any]) -> Optional[str]:
-    """Storage id файлового результата из metadata.storage_id (для переиспользования как референс)."""
-    meta = result_item.get("metadata")
-    if isinstance(meta, dict):
-        sid = meta.get("storage_id")
-        if isinstance(sid, str) and sid:
-            try:
-                return validate_media_input(normalize_storage_id(sid))
-            except FatalApiError:
-                return None
-    return None
-
-
 def save_result_item_to_file(result_item: Dict[str, Any], path: Path) -> None:
     """
     Сохраняет GenerationResultItem в path.
@@ -497,6 +550,7 @@ def generate_image_flower(
     prompt: str,
     aspect_ratio: str,
     references: Optional[List[CharacterRef]] = None,
+    state: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """
     Генерация картинки через Flower.
@@ -505,34 +559,58 @@ def generate_image_flower(
     С референсом — operation flower_image_edit (img2img). Референсы уходят в inputs[]
     как именованные V6NamedMediaInput, а промпт ссылается на них по filename.
     Число референсов ограничено FLOWER_MAX_REFERENCES (Flower стабильно работает с одним).
+
+    Storage id референсов имеют TTL: если API вернул "file_not_found_or_expired",
+    перезагружаем файлы персонажей из локальных копий (через state) и повторяем.
     Возвращает GenerationResultItem (dict) после ожидания завершения.
     """
     url = clean_base_url(BASE_URL) + V6_GENERATIONS_ENDPOINT
-    payload: Dict[str, Any] = {
-        "operation": OP_IMAGE_GENERATE,
-        "prompt": prompt,
-        "aspect_ratio": validate_aspect_ratio(aspect_ratio),
-    }
-    if GENERATION_SEED is not None:
-        payload["seed"] = GENERATION_SEED
 
-    refs = references or []
-    if refs:
-        if len(refs) > FLOWER_MAX_REFERENCES:
-            log(
-                f"[WARN] Референсов {len(refs)}, лимит FLOWER_MAX_REFERENCES={FLOWER_MAX_REFERENCES} — "
-                f"беру первые {FLOWER_MAX_REFERENCES}."
-            )
-            refs = refs[:FLOWER_MAX_REFERENCES]
-        payload["operation"] = OP_IMAGE_EDIT
-        payload["prompt"] = compose_scene_prompt_with_refs(prompt, refs)
-        payload["inputs"] = [named_media_input(r.storage_id, r.filename) for r in refs]
+    refs = list(references or [])
+    if len(refs) > FLOWER_MAX_REFERENCES:
+        log(
+            f"[WARN] Референсов {len(refs)}, лимит FLOWER_MAX_REFERENCES={FLOWER_MAX_REFERENCES} — "
+            f"беру первые {FLOWER_MAX_REFERENCES}."
+        )
+        refs = refs[:FLOWER_MAX_REFERENCES]
 
-    data = request_with_retries(url, payload)
-    generation_id = data.get("id")
-    if not generation_id:
-        raise RuntimeError(f"Flower image API не вернул generation id: {data}")
-    return poll_generation(generation_id)
+    def build_payload() -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "operation": OP_IMAGE_GENERATE,
+            "prompt": prompt,
+            "aspect_ratio": validate_aspect_ratio(aspect_ratio),
+        }
+        if GENERATION_SEED is not None:
+            payload["seed"] = GENERATION_SEED
+        if refs:
+            payload["operation"] = OP_IMAGE_EDIT
+            payload["prompt"] = compose_scene_prompt_with_refs(prompt, refs)
+            payload["inputs"] = [named_media_input(r.storage_id, r.filename) for r in refs]
+        return payload
+
+    # 1 обычная попытка + 1 после обновления протухших референсов.
+    for attempt in range(2):
+        try:
+            data = request_with_retries(url, build_payload())
+            generation_id = data.get("id")
+            if not generation_id:
+                raise RuntimeError(f"Flower image API не вернул generation id: {data}")
+            return poll_generation(generation_id)
+        except (FatalApiError, RuntimeError) as e:
+            can_refresh = refs and state is not None and attempt == 0 and is_expired_reference_error(e)
+            if not can_refresh:
+                raise
+            log("[INFO] Референс(ы) протухли в storage — перезагружаю из локальных файлов и повторяю.")
+            refreshed = False
+            for r in refs:
+                new_id = refresh_alias_storage_id(r.alias, state, r.storage_id)
+                if new_id and new_id != normalize_storage_id(r.storage_id):
+                    r.storage_id = new_id
+                    refreshed = True
+            if not refreshed:
+                raise
+
+    raise RuntimeError("generate_image_flower: исчерпаны попытки после обновления референсов")
 
 
 def scene_output_path(index: int) -> Path:
@@ -585,13 +663,12 @@ def build_character_refs(prompts: List[PromptLine], state: dict) -> dict:
         result_item = generate_image_flower(portrait_prompt, CHARACTER_ASPECT_RATIO)
         save_result_item_to_file(result_item, out_path)
 
-        # V6: если у результата уже есть metadata.storage_id — переиспользуем его как
-        # референс и не грузим файл в storage повторно. Иначе — грузим сохранённый файл.
-        file_hash = result_storage_id(result_item)
-        if file_hash:
-            log(f"[CHAR] {alias}: переиспользую storage_id результата (без повторной загрузки)")
-        else:
-            file_hash = upload_file_to_storage(out_path)
+        # Референс грузим как отдельный файл в storage (TTL ~1 час с последнего
+        # использования). Storage id самого результата НЕ переиспользуем как референс:
+        # у сгенерированного результата TTL короче (~30 мин), и он быстро протухает.
+        # Если id всё же истечёт в длинном прогоне — refresh_alias_storage_id перезальёт
+        # файл из локальной копии по пути ниже.
+        file_hash = upload_file_to_storage(out_path)
 
         state[alias] = {
             "path": str(out_path),
@@ -614,6 +691,7 @@ def collect_scene_references(p: PromptLine, state: dict) -> List[CharacterRef]:
                     alias=alias,
                     storage_id=normalize_storage_id(fh),
                     filename=reference_filename(alias),
+                    path=entry.get("path"),
                 )
             )
     return refs
@@ -637,7 +715,7 @@ def generate_one_scene(p: PromptLine, state: dict) -> dict:
     try:
         if refs:
             log(f"[SCENE] {p.index}: flower + ref через {', '.join(p.aliases[:3])}")
-            result_item = generate_image_flower(clean_prompt, SCENE_ASPECT_RATIO, refs)
+            result_item = generate_image_flower(clean_prompt, SCENE_ASPECT_RATIO, refs, state)
             mode = "flower_with_ref"
         else:
             log(f"[SCENE] {p.index}: flower без ref")
