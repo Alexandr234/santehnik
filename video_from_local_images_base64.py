@@ -108,6 +108,12 @@ RATE_WINDOW_SECONDS = 3600
 
 RETRY_SLEEP_429 = [20, 35, 60, 90]
 
+# Повтор при временном сбое генерации на стороне провайдера
+# (status=failed, кредит возвращён / "try again later"). Каждый повтор — это новый
+# старт видео, поэтому он учитывается лимитом 150/час.
+VIDEO_MAX_ATTEMPTS = max(1, int(os.getenv("FAST_GEN_VIDEO_MAX_ATTEMPTS", "3")))
+VIDEO_RETRY_BACKOFF = [15, 40, 90]
+
 # Если отдельного промпта для картинки нет, будет использоваться этот.
 DEFAULT_ANIMATION_PROMPT = (
     "Animate this image with gentle realistic motion, subtle cinematic camera movement, "
@@ -142,6 +148,10 @@ rate_limit_lock = threading.Lock()
 def log(message: str) -> None:
     with print_lock:
         print(message, flush=True)
+
+
+class TransientGenerationError(RuntimeError):
+    """Временный сбой генерации на стороне провайдера — имеет смысл повторить."""
 
 
 # =========================================================
@@ -494,6 +504,24 @@ def describe_failure(data: Dict[str, Any]) -> str:
     return str(err)
 
 
+def is_retryable_failure(data: Dict[str, Any]) -> bool:
+    """
+    True для временных сбоев провайдера, которые имеет смысл повторить:
+    кредит возвращён (usage.refunded) либо сообщение вида "try again later".
+    """
+    usage = data.get("usage") or {}
+    if isinstance(usage, dict) and usage.get("refunded") is True:
+        return True
+    msg = str(data.get("error") or "").lower()
+    return (
+        "try again" in msg
+        or "попробуйте позже" in msg
+        or "temporarily" in msg
+        or "timeout" in msg
+        or "timed out" in msg
+    )
+
+
 def poll_operation(generation_id: str, scene_index: int) -> Dict[str, Any]:
     url = normalize_base_url(BASE_URL) + V6_GENERATION_STATUS_ENDPOINT.format(generation_id=generation_id)
 
@@ -530,10 +558,14 @@ def poll_operation(generation_id: str, scene_index: int) -> Dict[str, Any]:
             return data
 
         if status in TERMINAL_FAILURE:
-            raise RuntimeError(
-                f"[ERROR] {scene_index:04d}: генерация {generation_id} завершилась со статусом {status}: "
-                f"{describe_failure(data)}"
+            detail = describe_failure(data)
+            message = (
+                f"[ERROR] {scene_index:04d}: генерация {generation_id} завершилась со статусом "
+                f"{status}: {detail}"
             )
+            if is_retryable_failure(data):
+                raise TransientGenerationError(message)
+            raise RuntimeError(message)
 
         time.sleep(POLL_INTERVAL)
 
@@ -582,6 +614,34 @@ def build_scene_items() -> List[SceneItem]:
     return scenes
 
 
+def start_and_wait_video(item: SceneItem, image_data_uri: str) -> tuple[Dict[str, Any], str, int]:
+    """
+    Стартует видео и ждёт результат, повторяя при временных сбоях провайдера
+    (TransientGenerationError). Возвращает (op_result, generation_id, attempts_used).
+    Каждая попытка — новый старт, поэтому берёт слот у лимитера 150/час.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, VIDEO_MAX_ATTEMPTS + 1):
+        video_rate_limiter.acquire(item.scene_index)
+        generation_id = start_video_from_ingredients(item.prompt, image_data_uri)
+        try:
+            op_result = poll_operation(generation_id, item.scene_index)
+            return op_result, generation_id, attempt
+        except TransientGenerationError as e:
+            last_exc = e
+            if attempt < VIDEO_MAX_ATTEMPTS:
+                delay = VIDEO_RETRY_BACKOFF[min(attempt - 1, len(VIDEO_RETRY_BACKOFF) - 1)]
+                log(
+                    f"[RETRY] {item.scene_index:04d}: временный сбой провайдера "
+                    f"(попытка {attempt}/{VIDEO_MAX_ATTEMPTS}): {e}. Повтор через {delay}с"
+                )
+                time.sleep(delay)
+                continue
+            break
+    assert last_exc is not None
+    raise last_exc
+
+
 def process_scene_item(item: SceneItem) -> None:
     out_path = VIDEOS_DIR / f"{item.image_path.stem}.mp4"
 
@@ -599,10 +659,7 @@ def process_scene_item(item: SceneItem) -> None:
         log(f"[VIDEO] {item.scene_index:04d}: оживляю {item.image_path.name}")
         image_data_uri = image_to_data_uri(item.image_path)
 
-        video_rate_limiter.acquire(item.scene_index)
-        generation_id = start_video_from_ingredients(item.prompt, image_data_uri)
-
-        op_result = poll_operation(generation_id, item.scene_index)
+        op_result, generation_id, attempts_used = start_and_wait_video(item, image_data_uri)
         video_source = extract_video_source(op_result)
         save_video_from_source(video_source, out_path)
 
@@ -614,6 +671,7 @@ def process_scene_item(item: SceneItem) -> None:
             "mode": "image_to_video_base64",
             "output": str(out_path),
             "generation_id": generation_id,
+            "attempts": attempts_used,
             "image": str(item.image_path),
             "prompt": item.prompt,
         })
@@ -648,6 +706,7 @@ def main() -> None:
     log(f"[INFO] Найдено картинок: {len(scenes)}")
     log(f"[INFO] Потоков: {MAX_WORKERS}")
     log(f"[INFO] Лимит: {MAX_VIDEO_STARTS_PER_HOUR} стартов видео в час")
+    log(f"[INFO] Повторов при временном сбое провайдера: до {VIDEO_MAX_ATTEMPTS}")
     log(f"[INFO] Aspect ratio: {ASPECT_RATIO}")
     extras = []
     if VIDEO_MODEL:
