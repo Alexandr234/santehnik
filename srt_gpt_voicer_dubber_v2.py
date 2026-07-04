@@ -1763,19 +1763,16 @@ def interactive_collect_args() -> argparse.Namespace:
                 print(f"  [!] Файл не найден: {srt}. Попробуй ещё раз.")
                 srt = ""
 
-    lang = ""
-    while lang not in {"RU", "ES", "PT", "ALL"}:
-        lang = _prompt("Язык (RU / ES / PT / ALL)", "RU").upper()
-        if lang not in {"RU", "ES", "PT", "ALL"}:
-            print("  [!] Допустимо: RU, ES, PT или ALL.")
+    # Всё остальное — автоматически, без вопросов:
+    #  - переводим и озвучиваем сразу на все языки (RU, ES, PT);
+    #  - видео не трогаем;
+    #  - папку результатов создаём сами рядом со скриптом.
+    lang = "ALL"
+    video = None
+    outdir = str(script_dir / "dub_output")
 
-    video = _prompt("Путь к видео для озвучки (необязательно, Enter — пропустить)")
-    video = video.strip().strip('"').strip("'") or None
-    if video and not Path(video).expanduser().exists():
-        print(f"  [!] Видео не найдено, продолжаю без него: {video}")
-        video = None
-
-    outdir = _prompt("Папка для результатов", str(OUTPUT_DIR))
+    print("Языки: RU, ES, PT — сделаю все три озвучки.")
+    print(f"Результаты сохраню в: {outdir}")
 
     # Собираем namespace с теми же полями, что и parse_args().
     return argparse.Namespace(
