@@ -1731,13 +1731,37 @@ def interactive_collect_args() -> argparse.Namespace:
     print("Нажимай Enter, чтобы оставить значение по умолчанию.")
     print("=" * 70)
 
+    # Ищем .srt файлы рядом со скриптом (и в текущей папке), чтобы не спрашивать.
+    search_dirs = []
+    script_dir = Path(__file__).resolve().parent
+    search_dirs.append(script_dir)
+    cwd = Path.cwd().resolve()
+    if cwd != script_dir:
+        search_dirs.append(cwd)
+
+    srt_candidates: list[Path] = []
+    for d in search_dirs:
+        for p in sorted(d.glob("*.srt")):
+            if p not in srt_candidates:
+                srt_candidates.append(p)
+
     srt = ""
-    while not srt:
-        srt = _prompt("Путь к .srt файлу (можно перетащить файл в окно)")
-        srt = srt.strip().strip('"').strip("'")
-        if srt and not Path(srt).expanduser().exists():
-            print(f"  [!] Файл не найден: {srt}. Попробуй ещё раз.")
-            srt = ""
+    if len(srt_candidates) == 1:
+        # Ровно один .srt рядом — берём его автоматически, ничего не спрашиваем.
+        srt = str(srt_candidates[0])
+        print(f"Нашёл файл субтитров автоматически: {srt}")
+    else:
+        default_srt = str(srt_candidates[0]) if srt_candidates else ""
+        if len(srt_candidates) > 1:
+            print("Рядом найдено несколько .srt файлов:")
+            for p in srt_candidates:
+                print(f"   - {p.name}")
+        while not srt:
+            srt = _prompt("Путь к .srt файлу (Enter — взять найденный / перетащи файл в окно)", default_srt)
+            srt = srt.strip().strip('"').strip("'")
+            if srt and not Path(srt).expanduser().exists():
+                print(f"  [!] Файл не найден: {srt}. Попробуй ещё раз.")
+                srt = ""
 
     lang = ""
     while lang not in {"RU", "ES", "PT", "ALL"}:
