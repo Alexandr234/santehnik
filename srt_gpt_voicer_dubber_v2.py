@@ -67,6 +67,12 @@ BOOTSTRAP_REQUIREMENTS = [
     "imageio-ffmpeg",  # переносимый ffmpeg на случай, если системного нет
 ]
 
+# В Python 3.13 из стандартной библиотеки удалили модуль audioop,
+# без которого pydub не импортируется. Ставим бэкпорт audioop-lts,
+# который возвращает audioop для Python 3.13+.
+if sys.version_info >= (3, 13):
+    BOOTSTRAP_REQUIREMENTS.append("audioop-lts")
+
 # Имя папки с виртуальным окружением (создаётся рядом со скриптом).
 BOOTSTRAP_VENV_DIR = ".venv_dubber"
 
