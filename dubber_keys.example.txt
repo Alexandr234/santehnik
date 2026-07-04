@@ -1,0 +1,9 @@
+# Скопируй этот файл в dubber_keys.txt и вставь свои ключи.
+# Файл dubber_keys.txt НЕ загружается в GitHub (он в .gitignore).
+#
+# Ключи можно взять из твоего старого файла скрипта
+# (srt_gpt_voicer_dubber_v2_FIXED_BACKUP_DOMAIN.py) — там они были
+# в переменных OPENAI_API_KEY и VOICER_API_KEY.
+
+OPENAI_API_KEY=sk-proj-ВСТАВЬ_СЮДА
+VOICER_API_KEY=ВСТАВЬ_СЮДА

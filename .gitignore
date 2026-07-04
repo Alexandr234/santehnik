@@ -1,0 +1,4 @@
+.venv_dubber/
+__pycache__/
+dub_output/
+dubber_keys.txt
