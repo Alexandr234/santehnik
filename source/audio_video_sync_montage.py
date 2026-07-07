@@ -353,8 +353,76 @@ class Transcript:
     language: str = ""
 
 
+# Лимит OpenAI на файл транскрибации — 25 МБ. Берём запас.
+WHISPER_MAX_BYTES = 24 * 1024 * 1024
+# На сколько секунд резать сжатое аудио, если оно всё ещё больше лимита.
+WHISPER_CHUNK_SECONDS = int(os.getenv("WHISPER_CHUNK_SECONDS", "1200"))  # 20 мин
+
+
+def _run_whisper_file(client: Any, path: Path) -> Dict[str, Any]:
+    """Один вызов Whisper по файлу. Фолбэк: word+segment -> только segment."""
+    try:
+        with path.open("rb") as f:
+            resp = client.audio.transcriptions.create(
+                model=WHISPER_MODEL, file=f, response_format="verbose_json",
+                timestamp_granularities=["word", "segment"],
+            )
+    except Exception as e:
+        warn(f"Word-таймкоды не сработали ({str(e)[:120]}). Пробую только сегменты.")
+        with path.open("rb") as f:
+            resp = client.audio.transcriptions.create(
+                model=WHISPER_MODEL, file=f, response_format="verbose_json",
+            )
+    return resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+
+
+def _compress_audio_for_whisper(src: Path, out: Path) -> Optional[Path]:
+    """Сжимает в моно 16кГц mp3 32кбит — Whisper'у этого достаточно, файл в разы меньше."""
+    if not which("ffmpeg"):
+        return None
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(src), "-ac", "1", "-ar", "16000",
+        "-c:a", "libmp3lame", "-b:a", "32k", str(out),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        warn(f"Сжатие аудио не удалось: {e.stderr[:200]}")
+        return None
+    return out if out.exists() and out.stat().st_size > 0 else None
+
+
+def _split_audio_into_chunks(src: Path, chunk_seconds: int, tmp_dir: Path) -> List[Tuple[Path, float]]:
+    """Режет аудио на части; возвращает [(файл, смещение_в_секундах), ...]."""
+    if not which("ffmpeg"):
+        return []
+    pattern = str(tmp_dir / "chunk_%03d.mp3")
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(src), "-f", "segment", "-segment_time", str(chunk_seconds),
+        "-c", "copy", pattern,
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        warn(f"Нарезка аудио не удалась: {e.stderr[:200]}")
+        return []
+    chunks = sorted(tmp_dir.glob("chunk_*.mp3"))
+    result: List[Tuple[Path, float]] = []
+    offset = 0.0
+    for c in chunks:
+        result.append((c, offset))
+        offset += probe_duration(c) or chunk_seconds
+    return result
+
+
 def transcribe_audio(audio_path: Path, api_key: str) -> Optional[Transcript]:
-    """Whisper с таймкодами слов и сегментов. Кэшируется в TRANSCRIPT_JSON."""
+    """
+    Whisper с таймкодами слов и сегментов. Кэшируется в TRANSCRIPT_JSON.
+    Большие файлы (>25 МБ) автоматически сжимаются, а очень длинные — режутся
+    на части, таймкоды которых затем сшиваются со смещением.
+    """
     cached = load_json(TRANSCRIPT_JSON, None)
     if isinstance(cached, dict) and cached.get("audio_name") == audio_path.name:
         info(f"Использую кэш транскрипта: {TRANSCRIPT_JSON.name}")
@@ -371,38 +439,71 @@ def transcribe_audio(audio_path: Path, api_key: str) -> Optional[Transcript]:
         return None
 
     client = OpenAI(api_key=api_key)
-    info(f"Транскрибирую {audio_path.name} через Whisper ({WHISPER_MODEL})...")
-    try:
-        with audio_path.open("rb") as f:
-            resp = client.audio.transcriptions.create(
-                model=WHISPER_MODEL,
-                file=f,
-                response_format="verbose_json",
-                timestamp_granularities=["word", "segment"],
-            )
-    except Exception as e:
-        # Некоторые аккаунты/модели не поддерживают granularities слов — пробуем проще.
-        warn(f"Whisper с word-таймкодами не сработал ({e}). Пробую только сегменты.")
-        try:
-            with audio_path.open("rb") as f:
-                resp = client.audio.transcriptions.create(
-                    model=WHISPER_MODEL,
-                    file=f,
-                    response_format="verbose_json",
-                )
-        except Exception as e2:
-            warn(f"Транскрибация не удалась: {e2}")
+    import shutil
+    tmp_dir = BASE_DIR / "_whisper_tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Если файл больше лимита — сжимаем.
+    src = audio_path
+    size_mb = src.stat().st_size / (1024 * 1024)
+    if src.stat().st_size > WHISPER_MAX_BYTES:
+        info(f"Аудио {size_mb:.1f} МБ > лимита Whisper 25 МБ — сжимаю (моно 16кГц)...")
+        compressed = _compress_audio_for_whisper(src, tmp_dir / "whisper_input.mp3")
+        if compressed:
+            src = compressed
+            info(f"Сжато до {src.stat().st_size / (1024 * 1024):.1f} МБ.")
+        else:
+            warn("Не удалось сжать (нет ffmpeg?) — попробую отправить как есть.")
+
+    # 2) Формируем список файлов для отправки (при необходимости — с нарезкой).
+    if src.stat().st_size <= WHISPER_MAX_BYTES:
+        files_with_offset: List[Tuple[Path, float]] = [(src, 0.0)]
+    else:
+        info(f"Всё ещё {src.stat().st_size / (1024*1024):.1f} МБ — режу на части по "
+             f"{WHISPER_CHUNK_SECONDS//60} мин...")
+        files_with_offset = _split_audio_into_chunks(src, WHISPER_CHUNK_SECONDS, tmp_dir)
+        if not files_with_offset:
+            warn("Не удалось подготовить аудио для Whisper.")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
             return None
 
-    data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
-    tr = _transcript_from_dict(data)
-    data_to_cache = {
+    # 3) Транскрибируем каждый файл и сшиваем таймкоды со смещением.
+    info(f"Транскрибирую {audio_path.name} через Whisper ({WHISPER_MODEL}), "
+         f"частей: {len(files_with_offset)}...")
+    all_words: List[Word] = []
+    all_segments: List[Segment] = []
+    language = ""
+    ok = False
+    for idx, (fpath, offset) in enumerate(files_with_offset, start=1):
+        try:
+            data = _run_whisper_file(client, fpath)
+        except Exception as e:
+            warn(f"Часть {idx}/{len(files_with_offset)} не транскрибировалась: {str(e)[:160]}")
+            continue
+        part = _transcript_from_dict(data)
+        language = language or part.language
+        for w in part.words:
+            all_words.append(Word(text=w.text, start=w.start + offset, end=w.end + offset))
+        for s in part.segments:
+            all_segments.append(Segment(text=s.text, start=s.start + offset, end=s.end + offset))
+        ok = True
+        if len(files_with_offset) > 1:
+            info(f"  часть {idx}/{len(files_with_offset)} готова "
+                 f"(+{len(part.words)} слов)")
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    if not ok:
+        warn("Транскрибация не удалась ни для одной части.")
+        return None
+
+    tr = Transcript(words=all_words, segments=all_segments, language=language)
+    save_json(TRANSCRIPT_JSON, {
         "audio_name": audio_path.name,
         "language": tr.language,
         "words": [w.__dict__ for w in tr.words],
         "segments": [s.__dict__ for s in tr.segments],
-    }
-    save_json(TRANSCRIPT_JSON, data_to_cache)
+    })
     info(f"Транскрипт: слов={len(tr.words)}, сегментов={len(tr.segments)}, язык={tr.language or '?'}")
     return tr
 
