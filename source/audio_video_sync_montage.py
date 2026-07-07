@@ -34,6 +34,13 @@
   5) Через ffmpeg подгоняет каждый ролик под его слот (короче -> обрезка,
      длиннее -> фриз последнего кадра / замедление / луп), клеит по порядку и
      накладывает оригинальное аудио. Итоговая длина == длине аудио.
+     Во время сборки печатается живая шкала готовности монтажа.
+
+  Недостающие ролики (ещё не сгенерированные) по умолчанию (MISSING_MODE=stretch)
+  НЕ дают чёрных вставок: их время делится поровну между соседними готовыми
+  роликами — сосед показывает больше своего материала, а если слот превысит длину
+  клипа, сосед замедляется (setpts, с ограничением MAX_SLOW_FACTOR, дальше фриз).
+  MISSING_MODE=black возвращает старое поведение с чёрными слотами.
 
 РЕЖИМЫ ДЕГРАДАЦИИ (всё graceful):
   - нет OpenAI ключа / нет аудио для Whisper -> тайм-коды по символам (как в master);
@@ -109,6 +116,17 @@ MIN_SLOT_SECONDS = float(os.getenv("MIN_SLOT_SECONDS", "1.2"))
 # Что делать, когда слот ДЛИННЕЕ ролика: freeze | slow | loop.
 FILL_MODE = os.getenv("FILL_MODE", "freeze").strip().lower()
 
+# Что делать с недостающими роликами (которые ещё не сгенерированы):
+#   stretch — убрать дырку, а её время поделить поровну между соседними готовыми
+#             роликами (сосед показывает больше своего материала; если слот
+#             превысит длину клипа — сосед замедляется). ПО УМОЛЧАНИЮ.
+#   black   — вставлять чёрный слот на месте недостающего ролика (старое поведение).
+MISSING_MODE = os.getenv("MISSING_MODE", "stretch").strip().lower()
+
+# Максимальный коэффициент замедления соседа при растягивании. Выше — уже
+# слишком «слоу-мо», поэтому остаток добивается фризом последнего кадра.
+MAX_SLOW_FACTOR = float(os.getenv("MAX_SLOW_FACTOR", "3.0"))
+
 # Параметры финального рендера.
 TARGET_FPS = int(os.getenv("TARGET_FPS", "30"))
 # Пусто -> взять разрешение первого ролика; иначе, напр., "1920x1080".
@@ -177,6 +195,15 @@ def format_tc(seconds: float) -> str:
     m = int(seconds // 60)
     s = seconds - m * 60
     return f"{m:02d}:{s:06.3f}"
+
+
+def progress_bar(done: int, total: int, width: int = 32) -> str:
+    """ASCII-шкала готовности: [██████░░░░] 62.5% (done/total)."""
+    total = max(1, total)
+    frac = max(0.0, min(1.0, done / total))
+    filled = int(round(frac * width))
+    bar = "█" * filled + "░" * (width - filled)
+    return f"[{bar}] {frac * 100:5.1f}%  ({done}/{total} готово)"
 
 
 # =========================================================
@@ -691,6 +718,8 @@ class SceneTC:
     start: float = 0.0
     end: float = 0.0
     exists: bool = False
+    fill_mode: str = ""     # переопределение FILL_MODE для этого клипа ("slow" у растянутых)
+    stretched: bool = False  # клип поглотил время недостающего соседа
 
 
 def load_scenes() -> List[SceneTC]:
@@ -873,7 +902,12 @@ def build_timecodes() -> List[SceneTC]:
     info(f"Сцен/роликов: {len(scenes)} (источник: {source})")
     missing = [sc.video_file for sc in scenes if not sc.exists]
     if missing:
-        warn(f"Отсутствуют файлы роликов ({len(missing)}): {', '.join(missing[:8])}{'...' if len(missing) > 8 else ''}")
+        warn(f"Не хватает {len(missing)} из {len(scenes)} роликов: {', '.join(missing[:8])}"
+             f"{'...' if len(missing) > 8 else ''}")
+        if MISSING_MODE == "stretch":
+            info("Режим MISSING_MODE=stretch: дырки закрою растягиванием соседних роликов.")
+        else:
+            info(f"Режим MISSING_MODE={MISSING_MODE}: на месте недостающих будет чёрный слот.")
 
     # транскрипт
     api_key = resolve_openai_key()
@@ -977,10 +1011,10 @@ def parse_target_resolution(scenes: List[SceneTC]) -> Tuple[int, int]:
     return 1920, 1080
 
 
-def build_clip_filter(slot: float, src_dur: Optional[float], w: int, h: int) -> str:
+def build_clip_filter(slot: float, src_dur: Optional[float], w: int, h: int, fill_mode: str) -> str:
     """
     Фильтр видео: масштаб с сохранением пропорций + паддинг до WxH + fps + SAR.
-    Заполнение длинного слота по FILL_MODE.
+    Заполнение слота, который ДЛИННЕЕ ролика, по fill_mode: slow | loop | freeze.
     """
     base = (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
@@ -989,14 +1023,21 @@ def build_clip_filter(slot: float, src_dur: Optional[float], w: int, h: int) -> 
     src = src_dur if (src_dur and src_dur > 0) else CLIP_SECONDS
 
     if slot <= src + 0.05:
-        # слот короче/равен ролику -> просто обрежем по -t, фильтр без изменений
+        # слот короче/равен ролику -> просто обрежем по -t (покажем часть клипа)
         return base
 
     # слот длиннее ролика
-    if FILL_MODE == "slow":
+    if fill_mode == "slow":
         factor = slot / src
-        return f"setpts={factor:.5f}*PTS," + base
-    if FILL_MODE == "loop":
+        if factor <= MAX_SLOW_FACTOR:
+            # замедляем весь клип ровно под слот
+            return f"setpts={factor:.5f}*PTS," + base
+        # замедляем до предела, остаток добиваем фризом последнего кадра
+        slowed = src * MAX_SLOW_FACTOR
+        extra = slot - slowed
+        return (f"setpts={MAX_SLOW_FACTOR:.5f}*PTS," + base +
+                f",tpad=stop_mode=clone:stop_duration={extra:.3f}")
+    if fill_mode == "loop":
         # луп реализуем на входе (-stream_loop), фильтр обычный
         return base
     # freeze (по умолчанию): доигрываем и замораживаем последний кадр
@@ -1009,13 +1050,14 @@ def render_clip(sc: SceneTC, w: int, h: int, tmp_dir: Path) -> Optional[Path]:
     slot = max(MIN_SLOT_SECONDS, sc.end - sc.start)
     out = tmp_dir / f"seg_{sc.global_scene_index:04d}.mp4"
     src_dur = probe_duration(src_path)
+    fill_mode = sc.fill_mode or FILL_MODE
 
     input_args: List[str] = []
-    if FILL_MODE == "loop" and src_dur and slot > src_dur + 0.05:
+    if fill_mode == "loop" and src_dur and slot > src_dur + 0.05:
         loops = int(math.ceil(slot / src_dur))
         input_args = ["-stream_loop", str(loops)]
 
-    vf = build_clip_filter(slot, src_dur, w, h)
+    vf = build_clip_filter(slot, src_dur, w, h, fill_mode)
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         *input_args,
@@ -1051,6 +1093,74 @@ def render_black(slot: float, w: int, h: int, out: Path) -> Optional[Path]:
     return out
 
 
+def _copy_scene(sc: SceneTC) -> SceneTC:
+    return SceneTC(
+        global_scene_index=sc.global_scene_index, block_id=sc.block_id,
+        scene_index_in_block=sc.scene_index_in_block,
+        sentence_indexes=list(sc.sentence_indexes), block_text=sc.block_text,
+        subject=sc.subject, video_file=sc.video_file, anchor=sc.anchor,
+        start=sc.start, end=sc.end, exists=sc.exists,
+        fill_mode=sc.fill_mode, stretched=sc.stretched,
+    )
+
+
+def redistribute_missing_slots(scenes: List[SceneTC]) -> List[SceneTC]:
+    """
+    Убирает недостающие ролики и делит их время между соседними готовыми:
+    время сплошного «провала» из отсутствующих роликов делится ПОПОЛАМ между
+    ближайшим готовым слева и ближайшим готовым справа (если сосед только с
+    одной стороны — забирает всё). Растянутые соседи помечаются fill_mode="slow",
+    чтобы при выходе за длину клипа замедляться, а не мигать чёрным.
+
+    Тайминги остаются непрерывными, суммарная длина сохраняется -> синхрон с аудио.
+    Возвращает новый список только из готовых сцен (в исходном порядке).
+    """
+    out = [_copy_scene(sc) for sc in scenes if sc.exists]
+    if not out or all(sc.exists for sc in scenes):
+        return out
+
+    by_gsi = {c.global_scene_index: c for c in out}
+
+    i = 0
+    n = len(scenes)
+    while i < n:
+        if scenes[i].exists:
+            i += 1
+            continue
+        # накопить сплошной провал недостающих [i..j)
+        j = i
+        while j < n and not scenes[j].exists:
+            j += 1
+        run = scenes[i:j]
+        run_start = run[0].start
+        run_end = run[-1].end
+        gap = max(0.0, run_end - run_start)
+
+        prev_exist = scenes[i - 1] if i - 1 >= 0 and scenes[i - 1].exists else None
+        next_exist = scenes[j] if j < n and scenes[j].exists else None
+        prev_copy = by_gsi.get(prev_exist.global_scene_index) if prev_exist else None
+        next_copy = by_gsi.get(next_exist.global_scene_index) if next_exist else None
+
+        if prev_copy and next_copy:
+            mid = run_start + gap / 2.0
+            prev_copy.end = mid
+            next_copy.start = mid
+            prev_copy.stretched = next_copy.stretched = True
+            prev_copy.fill_mode = next_copy.fill_mode = "slow"
+        elif prev_copy:
+            prev_copy.end = run_end
+            prev_copy.stretched = True
+            prev_copy.fill_mode = "slow"
+        elif next_copy:
+            next_copy.start = run_start
+            next_copy.stretched = True
+            next_copy.fill_mode = "slow"
+        # если соседей нет вообще (весь ролик пуст) — просто пропускаем провал
+        i = j
+
+    return out
+
+
 def select_preview_scenes(scenes: List[SceneTC], preview_seconds: float) -> List[SceneTC]:
     """
     Оставляет только сцены, попадающие в окно [0, preview_seconds].
@@ -1060,19 +1170,8 @@ def select_preview_scenes(scenes: List[SceneTC], preview_seconds: float) -> List
     for sc in scenes:
         if sc.start >= preview_seconds:
             break
-        clip = SceneTC(
-            global_scene_index=sc.global_scene_index,
-            block_id=sc.block_id,
-            scene_index_in_block=sc.scene_index_in_block,
-            sentence_indexes=list(sc.sentence_indexes),
-            block_text=sc.block_text,
-            subject=sc.subject,
-            video_file=sc.video_file,
-            anchor=sc.anchor,
-            start=sc.start,
-            end=min(sc.end, preview_seconds),
-            exists=sc.exists,
-        )
+        clip = _copy_scene(sc)
+        clip.end = min(sc.end, preview_seconds)
         selected.append(clip)
     return selected
 
@@ -1087,6 +1186,14 @@ def render_montage(scenes: List[SceneTC], preview_seconds: Optional[float] = Non
     if not audio_path:
         warn("Нет аудио — монтаж без звука не имеет смысла, пропускаю.")
         return
+
+    # Недостающие ролики: либо растягиваем соседей (stretch), либо чёрные вставки.
+    missing_total = sum(1 for sc in scenes if not sc.exists)
+    if missing_total and MISSING_MODE == "stretch":
+        scenes = redistribute_missing_slots(scenes)
+        stretched = sum(1 for sc in scenes if sc.stretched)
+        info(f"Растягиваю соседей вместо {missing_total} недостающих роликов "
+             f"(затронуто клипов: {stretched}).")
 
     out_video = FINAL_VIDEO
     limit_seconds: Optional[float] = None
@@ -1106,18 +1213,28 @@ def render_montage(scenes: List[SceneTC], preview_seconds: Optional[float] = Non
     tmp_dir = BASE_DIR / "_montage_tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    total = len(scenes)
+    total_dur = sum(max(MIN_SLOT_SECONDS, sc.end - sc.start) for sc in scenes) or 1.0
+    done_dur = 0.0
     segments: List[Path] = []
-    for sc in scenes:
+    for i, sc in enumerate(scenes, start=1):
         slot = max(MIN_SLOT_SECONDS, sc.end - sc.start)
         if sc.exists:
             seg = render_clip(sc, w, h, tmp_dir)
         else:
-            warn(f"{sc.video_file} отсутствует — вставляю чёрный слот {slot:.1f}s.")
             seg = render_black(slot, w, h, tmp_dir / f"seg_{sc.global_scene_index:04d}.mp4")
         if seg:
             segments.append(seg)
-            print(f"  [{sc.global_scene_index:04d}] {format_tc(sc.start)}->{format_tc(sc.end)} "
-                  f"({slot:4.1f}s) {sc.video_file}", flush=True)
+        done_dur += slot
+        # живая шкала готовности монтажа (по доле собранного таймлайна)
+        tag = "растянут" if sc.stretched else ("чёрный" if not sc.exists else "")
+        sys.stdout.write(
+            f"\rМонтаж {progress_bar(i, total)}  {format_tc(done_dur)}/{format_tc(total_dur)}  "
+            f"[{sc.video_file}{(' ' + tag) if tag else ''}]        "
+        )
+        sys.stdout.flush()
+    sys.stdout.write("\n")
+    sys.stdout.flush()
 
     if not segments:
         warn("Не удалось подготовить ни одного сегмента — монтаж отменён.")
