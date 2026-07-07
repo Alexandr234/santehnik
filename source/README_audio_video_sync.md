@@ -72,16 +72,47 @@ scenario.txt
 пробелы аккуратно закроются соседями, а по мере готовности новых роликов монтаж
 будет становиться всё «плотнее».
 
+## Мультиязычный монтаж (en / ru / es / pt)
+
+Ролики одни и те же для всех языков — меняются только **озвучка и тайминги**
+(одна фраза на разных языках длится по-разному). Скрипт делает отдельный монтаж
+под каждую найденную озвучку.
+
+**Аудиофайлы в папке ПРОМПТЫ:**
+- английский — единственный аудиофайл, чьё имя **не** начинается с `scenario`
+  (напр. `paul_third_heaven@…​.mp3`);
+- `scenario_ru.mp3`, `scenario_es.mp3`, `scenario_pt.mp3` — адаптации.
+
+**Выходные файлы по языкам:**
+
+| Язык | Монтаж | Тайм-коды |
+|---|---|---|
+| en | `final_montage.mp4` | `video_timecodes.json` / `.txt` |
+| ru | `final_montage_ru.mp4` | `video_timecodes_ru.json` / `.txt` |
+| es | `final_montage_es.mp4` | `video_timecodes_es.json` / `.txt` |
+| pt | `final_montage_pt.mp4` | `video_timecodes_pt.json` / `.txt` |
+
+**Как английские сцены ложатся под иностранную озвучку:** иностранное аудио
+переводится Whisper'ом в **английский текст с таймкодами** (`audio.translations`)
+и выравнивается на английский `scenario.txt`. Так каждый ролик встаёт под смысл
+нужной фразы с реальным темпом речи именно этого языка. Если перевод не
+выровнялся — откат на пропорциональные тайминги под длину этой озвучки.
+
+Если `final_montage.mp4` уже есть, английский считается готовым и пропускается —
+собираются только остальные языки. Пересобрать всё: `--force`.
+
 ## Запуск
 
 ```bash
 export OPENAI_API_KEY="sk-..."        # или положить ключ в ПРОМПТЫ/openai_key.txt
 
-python audio_video_sync_montage.py                    # тайм-коды + полный монтаж
-python audio_video_sync_montage.py --preview           # ТЕСТ: только первая минута -> final_montage_preview.mp4
+python audio_video_sync_montage.py                    # ВСЕ языки: тайм-коды + монтаж
+python audio_video_sync_montage.py --langs ru,es      # только выбранные языки
+python audio_video_sync_montage.py --force            # пересобрать даже готовые монтажи
+python audio_video_sync_montage.py --preview           # ТЕСТ: первая минута каждого языка
 python audio_video_sync_montage.py --preview 30        # тест первых 30 секунд
 python audio_video_sync_montage.py --timecodes-only   # только этап 1
-python audio_video_sync_montage.py --render-only       # только монтаж по video_timecodes.json
+python audio_video_sync_montage.py --render-only       # только монтаж по video_timecodes[_xx].json
 python audio_video_sync_montage.py --render-only --preview   # быстрый превью-монтаж по готовым тайм-кодам
 ```
 

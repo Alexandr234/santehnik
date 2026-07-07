@@ -42,18 +42,45 @@
   клипа, сосед замедляется (setpts, с ограничением MAX_SLOW_FACTOR, дальше фриз).
   MISSING_MODE=black возвращает старое поведение с чёрными слотами.
 
+МУЛЬТИЯЗЫЧНОСТЬ (en / ru / es / pt)
+===================================
+Видео-ролики одни и те же для всех языков (визуал не зависит от языка) — меняются
+только ОЗВУЧКА и ТАЙМИНГИ (одна фраза на разных языках звучит разное время).
+
+Аудиофайлы в папке ПРОМПТЫ:
+  - английский  — единственный аудиофайл, чьё имя НЕ начинается с "scenario"
+                  (напр. paul_third_heaven@...mp3);
+  - scenario_ru.mp3 / scenario_es.mp3 / scenario_pt.mp3 — адаптации.
+
+Для каждого найденного языка скрипт считает СВОИ тайм-коды под его озвучку и
+собирает отдельный монтаж:
+  en -> final_montage.mp4 / video_timecodes.json
+  ru -> final_montage_ru.mp4 / video_timecodes_ru.json   (и так для es, pt)
+
+Как английские сцены ложатся под иностранную озвучку: иностранное аудио
+переводится Whisper'ом в АНГЛИЙСКИЙ текст с таймкодами (audio.translations) и
+выравнивается на английский scenario.txt тем же механизмом. Таким образом каждый
+ролик встаёт под смысл нужной фразы именно с темпом речи этого языка.
+
+Если final_montage.mp4 уже существует — английский монтаж считается готовым и
+пропускается (собираются только недостающие языки). Пересобрать всё: --force.
+
 РЕЖИМЫ ДЕГРАДАЦИИ (всё graceful):
   - нет OpenAI ключа / нет аудио для Whisper -> тайм-коды по символам (как в master);
-  - scenario.txt расходится с аудио -> пропорциональный откат внутри блоков;
+  - scenario.txt расходится с аудио (или перевод не выровнялся) -> пропорциональный
+    откат под длину именно этой озвучки;
   - нет scenario.txt -> раскидываем ролики равномерно по сегментам Whisper;
   - нет ffmpeg -> считаем и сохраняем только тайм-коды (этап 1), монтаж пропускаем.
 
 ЗАПУСК
 ======
     export OPENAI_API_KEY="sk-..."          # или положить ключ в ПРОМПТЫ/openai_key.txt
-    python audio_video_sync_montage.py                 # тайм-коды + монтаж
+    python audio_video_sync_montage.py                  # все языки: тайм-коды + монтаж
+    python audio_video_sync_montage.py --langs ru,es    # только выбранные языки
+    python audio_video_sync_montage.py --preview        # тест первой минуты каждого языка
     python audio_video_sync_montage.py --timecodes-only # только этап 1
     python audio_video_sync_montage.py --render-only     # только монтаж по готовым тайм-кодам
+    python audio_video_sync_montage.py --force           # пересобрать даже готовые монтажи
 
 Настройки таймингов и режима заполнения — через переменные окружения (см. CONFIG).
 """
@@ -210,18 +237,95 @@ def progress_bar(done: int, total: int, width: int = 32) -> str:
 # АУДИО
 # =========================================================
 
-def find_audio_file() -> Optional[Path]:
+def _audio_files() -> List[Path]:
     if not BASE_DIR.exists():
-        return None
+        return []
+    return sorted(
+        [p for p in BASE_DIR.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS],
+        key=lambda x: x.name.lower(),
+    )
+
+
+def find_audio_file() -> Optional[Path]:
+    """Совместимость: любое аудио (предпочитая voice/audio.*)."""
     for name in PREFERRED_AUDIO_NAMES:
         p = BASE_DIR / name
         if p.exists():
             return p
-    found = sorted(
-        [p for p in BASE_DIR.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS],
-        key=lambda x: x.name.lower(),
+    files = _audio_files()
+    return files[0] if files else None
+
+
+# ---- Мультиязычные локали -----------------------------------------------
+
+# Языки-адаптации: код -> ожидаемый stem аудиофайла (scenario_<code>).
+LOCALE_AUDIO_STEMS = {"ru": "scenario_ru", "es": "scenario_es", "pt": "scenario_pt"}
+# Порядок обработки.
+LOCALE_ORDER = ["en", "ru", "es", "pt"]
+
+
+@dataclass
+class Locale:
+    code: str
+    audio: Path
+    translate: bool           # переводить озвучку в EN для выравнивания на scenario.txt
+    transcript_json: Path
+    timecodes_json: Path
+    timecodes_txt: Path
+    out_video: Path
+    preview_video: Path
+
+
+def _suffixed(base_path: Path, code: str) -> Path:
+    """final_montage.mp4 -> final_montage_ru.mp4 (для en путь без изменений)."""
+    if code == "en":
+        return base_path
+    return base_path.with_name(f"{base_path.stem}_{code}{base_path.suffix}")
+
+
+def find_english_audio() -> Optional[Path]:
+    """Английская озвучка — единственный аудиофайл, чьё имя НЕ начинается с 'scenario'."""
+    for p in _audio_files():
+        if not p.stem.lower().startswith("scenario"):
+            return p
+    return None
+
+
+def _make_locale(code: str, audio: Path, translate: bool) -> Locale:
+    return Locale(
+        code=code,
+        audio=audio,
+        translate=translate,
+        transcript_json=_suffixed(TRANSCRIPT_JSON, code),
+        timecodes_json=_suffixed(TIMECODES_JSON, code),
+        timecodes_txt=_suffixed(TIMECODES_TXT, code),
+        out_video=_suffixed(FINAL_VIDEO, code),
+        preview_video=_suffixed(PREVIEW_VIDEO, code),
     )
-    return found[0] if found else None
+
+
+def discover_locales(selected: Optional[List[str]] = None) -> List[Locale]:
+    """
+    Находит доступные локали по аудиофайлам в папке.
+    en  -> аудио без префикса scenario; ru/es/pt -> scenario_<code>.<ext>.
+    selected ограничивает набор языков (None -> все найденные).
+    """
+    locales: List[Locale] = []
+    want = set(selected) if selected else None
+
+    for code in LOCALE_ORDER:
+        if want is not None and code not in want:
+            continue
+        if code == "en":
+            audio = find_english_audio()
+            if audio:
+                locales.append(_make_locale("en", audio, translate=False))
+        else:
+            stem = LOCALE_AUDIO_STEMS[code]
+            match = next((p for p in _audio_files() if p.stem.lower() == stem), None)
+            if match:
+                locales.append(_make_locale(code, match, translate=True))
+    return locales
 
 
 def ffprobe_duration(path: Path) -> Optional[float]:
@@ -386,8 +490,22 @@ WHISPER_MAX_BYTES = 24 * 1024 * 1024
 WHISPER_CHUNK_SECONDS = int(os.getenv("WHISPER_CHUNK_SECONDS", "1200"))  # 20 мин
 
 
-def _run_whisper_file(client: Any, path: Path) -> Dict[str, Any]:
-    """Один вызов Whisper по файлу. Фолбэк: word+segment -> только segment."""
+def _run_whisper_file(client: Any, path: Path, translate: bool = False) -> Dict[str, Any]:
+    """
+    Один вызов Whisper по файлу.
+    translate=False: транскрибация на языке оригинала, word+segment (фолбэк на segment).
+    translate=True:  перевод озвучки в АНГЛИЙСКИЙ текст с таймкодами (только segment) —
+                     нужно, чтобы иностранную озвучку можно было выровнять на английский
+                     scenario.txt тем же механизмом.
+    """
+    if translate:
+        # Endpoint переводов даёт только сегментные таймкоды (word-granularity не поддерживает).
+        with path.open("rb") as f:
+            resp = client.audio.translations.create(
+                model=WHISPER_MODEL, file=f, response_format="verbose_json",
+            )
+        return resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
+
     try:
         with path.open("rb") as f:
             resp = client.audio.transcriptions.create(
@@ -444,15 +562,18 @@ def _split_audio_into_chunks(src: Path, chunk_seconds: int, tmp_dir: Path) -> Li
     return result
 
 
-def transcribe_audio(audio_path: Path, api_key: str) -> Optional[Transcript]:
+def transcribe_audio(audio_path: Path, api_key: str,
+                     cache_path: Path = TRANSCRIPT_JSON, translate: bool = False) -> Optional[Transcript]:
     """
-    Whisper с таймкодами слов и сегментов. Кэшируется в TRANSCRIPT_JSON.
+    Whisper с таймкодами. Кэшируется в cache_path.
+    translate=True переводит иностранную озвучку в английский текст с таймкодами.
     Большие файлы (>25 МБ) автоматически сжимаются, а очень длинные — режутся
     на части, таймкоды которых затем сшиваются со смещением.
     """
-    cached = load_json(TRANSCRIPT_JSON, None)
-    if isinstance(cached, dict) and cached.get("audio_name") == audio_path.name:
-        info(f"Использую кэш транскрипта: {TRANSCRIPT_JSON.name}")
+    cached = load_json(cache_path, None)
+    if isinstance(cached, dict) and cached.get("audio_name") == audio_path.name \
+            and bool(cached.get("translated")) == translate:
+        info(f"Использую кэш транскрипта: {cache_path.name}")
         return _transcript_from_dict(cached)
 
     if not api_key:
@@ -467,7 +588,7 @@ def transcribe_audio(audio_path: Path, api_key: str) -> Optional[Transcript]:
 
     client = OpenAI(api_key=api_key)
     import shutil
-    tmp_dir = BASE_DIR / "_whisper_tmp"
+    tmp_dir = BASE_DIR / f"_whisper_tmp_{cache_path.stem}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) Если файл больше лимита — сжимаем.
@@ -494,18 +615,18 @@ def transcribe_audio(audio_path: Path, api_key: str) -> Optional[Transcript]:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return None
 
-    # 3) Транскрибируем каждый файл и сшиваем таймкоды со смещением.
-    info(f"Транскрибирую {audio_path.name} через Whisper ({WHISPER_MODEL}), "
-         f"частей: {len(files_with_offset)}...")
+    # 3) Транскрибируем/переводим каждый файл и сшиваем таймкоды со смещением.
+    mode = "перевод в EN" if translate else "транскрибация"
+    info(f"Whisper ({mode}) {audio_path.name}, частей: {len(files_with_offset)}...")
     all_words: List[Word] = []
     all_segments: List[Segment] = []
     language = ""
     ok = False
     for idx, (fpath, offset) in enumerate(files_with_offset, start=1):
         try:
-            data = _run_whisper_file(client, fpath)
+            data = _run_whisper_file(client, fpath, translate=translate)
         except Exception as e:
-            warn(f"Часть {idx}/{len(files_with_offset)} не транскрибировалась: {str(e)[:160]}")
+            warn(f"Часть {idx}/{len(files_with_offset)} не обработана: {str(e)[:160]}")
             continue
         part = _transcript_from_dict(data)
         language = language or part.language
@@ -525,8 +646,9 @@ def transcribe_audio(audio_path: Path, api_key: str) -> Optional[Transcript]:
         return None
 
     tr = Transcript(words=all_words, segments=all_segments, language=language)
-    save_json(TRANSCRIPT_JSON, {
+    save_json(cache_path, {
         "audio_name": audio_path.name,
+        "translated": translate,
         "language": tr.language,
         "words": [w.__dict__ for w in tr.words],
         "segments": [s.__dict__ for s in tr.segments],
@@ -878,19 +1000,8 @@ def finalize_timecodes(scenes: List[SceneTC], audio_seconds: float) -> None:
 # ЭТАП 1: ТАЙМ-КОДЫ
 # =========================================================
 
-def build_timecodes() -> List[SceneTC]:
-    if not BASE_DIR.exists():
-        fail(f"Нет базовой папки: {BASE_DIR}. Задай PROMPTS_BASE_DIR.")
-
-    scenario_text = SCENARIO_FILE.read_text(encoding="utf-8").strip() if SCENARIO_FILE.exists() else ""
-    audio_path = find_audio_file()
-    if audio_path:
-        info(f"Аудио: {audio_path.name}")
-    else:
-        warn("Аудиофайл не найден в папке ПРОМПТЫ.")
-    audio_seconds = get_audio_duration(audio_path, scenario_text)
-
-    # сцены
+def load_master_scenes() -> List[SceneTC]:
+    """Общие для всех языков сцены из generated_prompts.json (или из папки ВИДЕО)."""
     scenes = load_scenes()
     source = "generated_prompts.json"
     if not scenes:
@@ -908,16 +1019,28 @@ def build_timecodes() -> List[SceneTC]:
             info("Режим MISSING_MODE=stretch: дырки закрою растягиванием соседних роликов.")
         else:
             info(f"Режим MISSING_MODE={MISSING_MODE}: на месте недостающих будет чёрный слот.")
+    return scenes
 
-    # транскрипт
+
+def build_timecodes(loc: Locale, scenario_text: str, scenes_master: List[SceneTC]) -> List[SceneTC]:
+    """
+    Считает тайм-коды под озвучку конкретной локали. scenes_master — общие сцены
+    (визуал одинаков для всех языков). Для иностранных локалей аудио переводится
+    Whisper'ом в английский и выравнивается на английский scenario.txt, поэтому
+    ролики ложатся под смысл фраз именно ЭТОГО языка с его темпом речи.
+    """
+    scenes = [_copy_scene(sc) for sc in scenes_master]
+    audio_seconds = get_audio_duration(loc.audio, scenario_text)
+    info(f"[{loc.code}] аудио: {loc.audio.name} | {audio_seconds:.1f}s"
+         f"{' | перевод в EN' if loc.translate else ''}")
+
     api_key = resolve_openai_key()
-    tr = transcribe_audio(audio_path, api_key) if audio_path else None
+    tr = transcribe_audio(loc.audio, api_key, cache_path=loc.transcript_json,
+                          translate=loc.translate) if api_key else None
 
-    # выбор стратегии таймингов
     strategy = "proportional"
     if scenario_text and scenes and scenes[0].sentence_indexes:
         sentences = build_sentences(scenario_text)
-        sentences_by = {s.index: s for s in sentences}
         max_needed = max((max(sc.sentence_indexes) for sc in scenes if sc.sentence_indexes), default=0)
         if max_needed > len(sentences):
             warn(f"sentence_indexes ссылаются на {max_needed}, а предложений {len(sentences)} — "
@@ -926,30 +1049,30 @@ def build_timecodes() -> List[SceneTC]:
         coverage = 0.0
         if tr:
             coverage = align_sentences_to_transcript(sentences, tr)
-            info(f"Выравнивание сценария на аудио: coverage={coverage:.0%}")
+            info(f"[{loc.code}] выравнивание на аудио: coverage={coverage:.0%}")
         if tr and coverage >= ALIGN_MIN_COVERAGE:
-            strategy = "whisper-align"
+            strategy = "whisper-translate-align" if loc.translate else "whisper-align"
         else:
             if tr:
-                warn(f"Coverage {coverage:.0%} < порога {ALIGN_MIN_COVERAGE:.0%} — "
-                     f"откат на пропорциональные тайминги.")
+                warn(f"[{loc.code}] coverage {coverage:.0%} < порога {ALIGN_MIN_COVERAGE:.0%} — "
+                     f"откат на пропорциональные тайминги под длину этого аудио.")
             estimate_sentences_proportional(sentences, audio_seconds)
             strategy = "proportional"
         compute_anchors_from_sentences(scenes, sentences)
     else:
-        # нет сценария или нет sentence_indexes -> по сегментам/равномерно
         compute_anchors_from_segments(scenes, tr, audio_seconds)
         strategy = "whisper-segments" if (tr and tr.segments) else "uniform"
 
-    info(f"Стратегия таймингов: {strategy}")
+    info(f"[{loc.code}] стратегия таймингов: {strategy}")
     finalize_timecodes(scenes, audio_seconds)
-    save_timecodes(scenes, audio_seconds, strategy, audio_path)
+    save_timecodes(scenes, audio_seconds, strategy, loc)
     return scenes
 
 
-def save_timecodes(scenes: List[SceneTC], audio_seconds: float, strategy: str, audio_path: Optional[Path]) -> None:
+def save_timecodes(scenes: List[SceneTC], audio_seconds: float, strategy: str, loc: Locale) -> None:
     payload = {
-        "audio_file": audio_path.name if audio_path else None,
+        "locale": loc.code,
+        "audio_file": loc.audio.name,
         "audio_seconds": round(audio_seconds, 3),
         "strategy": strategy,
         "clip_seconds": CLIP_SECONDS,
@@ -971,10 +1094,10 @@ def save_timecodes(scenes: List[SceneTC], audio_seconds: float, strategy: str, a
             for sc in scenes
         ],
     }
-    save_json(TIMECODES_JSON, payload)
+    save_json(loc.timecodes_json, payload)
 
     lines = [
-        f"# Тайм-коды монтажа | аудио={payload['audio_file']} | {audio_seconds:.2f}s | стратегия={strategy}",
+        f"# Тайм-коды [{loc.code}] | аудио={loc.audio.name} | {audio_seconds:.2f}s | стратегия={strategy}",
         f"# файл    старт --> конец  (длина)  | блок/сцена | текст",
         "",
     ]
@@ -987,9 +1110,8 @@ def save_timecodes(scenes: List[SceneTC], audio_seconds: float, strategy: str, a
             f"{sc.video_file}  {format_tc(sc.start)} --> {format_tc(sc.end)}  "
             f"({sc.end - sc.start:4.1f}s)  | b{sc.block_id}.s{sc.scene_index_in_block} | {preview}{flag}"
         )
-    TIMECODES_TXT.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    info(f"Сохранено: {TIMECODES_JSON}")
-    info(f"Сохранено: {TIMECODES_TXT}")
+    loc.timecodes_txt.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    info(f"[{loc.code}] сохранено: {loc.timecodes_json.name}, {loc.timecodes_txt.name}")
 
 
 # =========================================================
@@ -1176,15 +1298,15 @@ def select_preview_scenes(scenes: List[SceneTC], preview_seconds: float) -> List
     return selected
 
 
-def render_montage(scenes: List[SceneTC], preview_seconds: Optional[float] = None) -> None:
+def render_montage(scenes: List[SceneTC], loc: Locale, preview_seconds: Optional[float] = None) -> None:
     if not which("ffmpeg"):
         warn("ffmpeg не найден — монтаж пропущен. Тайм-коды сохранены, "
              "монтаж можно собрать позже, установив ffmpeg. (ffprobe необязателен.)")
         return
 
-    audio_path = find_audio_file()
-    if not audio_path:
-        warn("Нет аудио — монтаж без звука не имеет смысла, пропускаю.")
+    audio_path = loc.audio
+    if not audio_path or not audio_path.exists():
+        warn(f"[{loc.code}] нет аудио — монтаж пропускаю.")
         return
 
     # Недостающие ролики: либо растягиваем соседей (stretch), либо чёрные вставки.
@@ -1192,25 +1314,25 @@ def render_montage(scenes: List[SceneTC], preview_seconds: Optional[float] = Non
     if missing_total and MISSING_MODE == "stretch":
         scenes = redistribute_missing_slots(scenes)
         stretched = sum(1 for sc in scenes if sc.stretched)
-        info(f"Растягиваю соседей вместо {missing_total} недостающих роликов "
+        info(f"[{loc.code}] растягиваю соседей вместо {missing_total} недостающих роликов "
              f"(затронуто клипов: {stretched}).")
 
-    out_video = FINAL_VIDEO
+    out_video = loc.out_video
     limit_seconds: Optional[float] = None
     if preview_seconds and preview_seconds > 0:
         if not scenes or scenes[0].start >= preview_seconds:
-            warn(f"В окне предпросмотра {preview_seconds:.0f}s нет ни одной сцены.")
+            warn(f"[{loc.code}] в окне предпросмотра {preview_seconds:.0f}s нет ни одной сцены.")
             return
         full_count = len(scenes)
         scenes = select_preview_scenes(scenes, preview_seconds)
         limit_seconds = min(preview_seconds, scenes[-1].end)
-        out_video = PREVIEW_VIDEO
-        info(f"РЕЖИМ ПРЕДПРОСМОТРА: первые {limit_seconds:.1f}s — {len(scenes)} из {full_count} сцен.")
+        out_video = loc.preview_video
+        info(f"[{loc.code}] ПРЕДПРОСМОТР: первые {limit_seconds:.1f}s — {len(scenes)} из {full_count} сцен.")
 
     w, h = parse_target_resolution(scenes)
-    info(f"Рендер {len(scenes)} сегментов в {w}x{h}@{TARGET_FPS}, режим заполнения={FILL_MODE}")
+    info(f"[{loc.code}] рендер {len(scenes)} сегментов в {w}x{h}@{TARGET_FPS}, заполнение={FILL_MODE}")
 
-    tmp_dir = BASE_DIR / "_montage_tmp"
+    tmp_dir = BASE_DIR / f"_montage_tmp_{loc.code}"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     total = len(scenes)
@@ -1229,7 +1351,7 @@ def render_montage(scenes: List[SceneTC], preview_seconds: Optional[float] = Non
         # живая шкала готовности монтажа (по доле собранного таймлайна)
         tag = "растянут" if sc.stretched else ("чёрный" if not sc.exists else "")
         sys.stdout.write(
-            f"\rМонтаж {progress_bar(i, total)}  {format_tc(done_dur)}/{format_tc(total_dur)}  "
+            f"\r[{loc.code}] Монтаж {progress_bar(i, total)}  {format_tc(done_dur)}/{format_tc(total_dur)}  "
             f"[{sc.video_file}{(' ' + tag) if tag else ''}]        "
         )
         sys.stdout.flush()
@@ -1284,27 +1406,76 @@ def render_montage(scenes: List[SceneTC], preview_seconds: Optional[float] = Non
     except subprocess.CalledProcessError as e:
         fail(f"Не удалось наложить аудио: {e.stderr[:300]}")
 
-    info(f"[DONE] Готовый монтаж: {out_video}")
-    info(f"Промежуточные файлы: {tmp_dir} (можно удалить).")
+    info(f"[{loc.code}] [DONE] Готовый монтаж: {out_video}")
+    info(f"[{loc.code}] промежуточные файлы: {tmp_dir} (можно удалить).")
 
 
 # =========================================================
 # MAIN
 # =========================================================
 
+def _scenes_from_timecode_payload(payload: Dict[str, Any]) -> List[SceneTC]:
+    return [
+        SceneTC(
+            global_scene_index=int(s["global_scene_index"]),
+            block_id=int(s.get("block_id") or 0),
+            scene_index_in_block=int(s.get("scene_index_in_block") or 1),
+            sentence_indexes=list(s.get("sentence_indexes") or []),
+            block_text=str(s.get("block_text") or ""),
+            subject=str(s.get("subject") or ""),
+            video_file=str(s["video_file"]),
+            start=float(s["start"]),
+            end=float(s["end"]),
+            exists=(VIDEOS_DIR / str(s["video_file"])).exists(),
+        )
+        for s in payload["scenes"]
+    ]
+
+
+def process_locale(loc: Locale, scenario_text: str, scenes_master: List[SceneTC],
+                   args, preview_seconds: Optional[float]) -> None:
+    header = f"===== ЛОКАЛЬ [{loc.code}] : {loc.audio.name} ====="
+    info("\n" + header)
+
+    # Пропуск уже готового монтажа (например английский final_montage.mp4 уже есть).
+    if (not args.force and not args.timecodes_only and preview_seconds is None
+            and loc.out_video.exists()):
+        info(f"[{loc.code}] {loc.out_video.name} уже существует — пропускаю "
+             f"(перезапуск: --force).")
+        return
+
+    if args.render_only:
+        payload = load_json(loc.timecodes_json, None)
+        if not isinstance(payload, dict) or not payload.get("scenes"):
+            warn(f"[{loc.code}] нет {loc.timecodes_json.name} — пропускаю (сначала без --render-only).")
+            return
+        scenes = _scenes_from_timecode_payload(payload)
+        info(f"[{loc.code}] загружены тайм-коды: {len(scenes)} сцен.")
+    else:
+        scenes = build_timecodes(loc, scenario_text, scenes_master)
+        if args.timecodes_only:
+            return
+
+    render_montage(scenes, loc, preview_seconds=preview_seconds)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Тайм-коды по аудио + автомонтаж 8-секундных роликов."
+        description="Мультиязычный монтаж: тайм-коды по аудио каждого языка + сборка."
     )
     parser.add_argument("--timecodes-only", action="store_true",
                         help="Только этап 1: посчитать и сохранить тайм-коды.")
     parser.add_argument("--render-only", action="store_true",
-                        help="Только этап 2: собрать монтаж по готовому video_timecodes.json.")
+                        help="Только этап 2: собрать монтаж по готовым video_timecodes[_xx].json.")
     parser.add_argument("--preview", nargs="?", type=float, const=PREVIEW_SECONDS_DEFAULT,
                         default=None, metavar="СЕК",
                         help="Смонтировать только первые N секунд (по умолчанию 60) в "
-                             "final_montage_preview.mp4 — быстрый тест без нагрузки. "
-                             "Тайм-коды считаются по всему аудио, полный монтаж не трогается.")
+                             "final_montage[_xx]_preview.mp4 — быстрый тест без нагрузки.")
+    parser.add_argument("--langs", type=str, default="", metavar="СПИСОК",
+                        help="Какие языки делать, через запятую: en,ru,es,pt. "
+                             "По умолчанию — все найденные по аудиофайлам.")
+    parser.add_argument("--force", action="store_true",
+                        help="Пересобрать даже если итоговый монтаж уже существует.")
     args = parser.parse_args()
 
     # Предпросмотр: приоритет у флага, иначе env PREVIEW_SECONDS.
@@ -1315,34 +1486,30 @@ def main() -> None:
         except ValueError:
             warn(f"PREVIEW_SECONDS={_PREVIEW_ENV!r} — не число, игнорирую.")
 
-    if args.render_only:
-        payload = load_json(TIMECODES_JSON, None)
-        if not isinstance(payload, dict) or not payload.get("scenes"):
-            fail(f"Нет {TIMECODES_JSON} — сначала запусти без --render-only.")
-        scenes = [
-            SceneTC(
-                global_scene_index=int(s["global_scene_index"]),
-                block_id=int(s.get("block_id") or 0),
-                scene_index_in_block=int(s.get("scene_index_in_block") or 1),
-                sentence_indexes=list(s.get("sentence_indexes") or []),
-                block_text=str(s.get("block_text") or ""),
-                subject=str(s.get("subject") or ""),
-                video_file=str(s["video_file"]),
-                start=float(s["start"]),
-                end=float(s["end"]),
-                exists=(VIDEOS_DIR / str(s["video_file"])).exists(),
-            )
-            for s in payload["scenes"]
-        ]
-        info(f"Загружены тайм-коды: {len(scenes)} сцен из {TIMECODES_JSON.name}")
-        render_montage(scenes, preview_seconds=preview_seconds)
-        return
+    if not BASE_DIR.exists():
+        fail(f"Нет базовой папки: {BASE_DIR}. Задай PROMPTS_BASE_DIR.")
 
-    scenes = build_timecodes()
-    if args.timecodes_only:
-        info("Готово (только тайм-коды). Для монтажа запусти с --render-only.")
-        return
-    render_montage(scenes, preview_seconds=preview_seconds)
+    selected = [x.strip().lower() for x in args.langs.split(",") if x.strip()] or None
+    locales = discover_locales(selected)
+    if not locales:
+        fail("Не найдено ни одной озвучки. Английская — аудио без префикса scenario; "
+             "адаптации — scenario_ru/es/pt.<ext>.")
+    info(f"Локали к обработке: {', '.join(l.code for l in locales)}")
+
+    scenario_text = SCENARIO_FILE.read_text(encoding="utf-8").strip() if SCENARIO_FILE.exists() else ""
+    if not scenario_text:
+        warn("scenario.txt (английский) не найден — выравнивание по смыслу будет ограничено.")
+    scenes_master = load_master_scenes()
+
+    for loc in locales:
+        try:
+            process_locale(loc, scenario_text, scenes_master, args, preview_seconds)
+        except SystemExit:
+            raise
+        except Exception as e:
+            warn(f"[{loc.code}] локаль пропущена из-за ошибки: {e}")
+
+    info("\n[ГОТОВО] Все локали обработаны.")
 
 
 if __name__ == "__main__":
