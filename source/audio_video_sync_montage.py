@@ -82,8 +82,15 @@ TIMECODES_JSON = BASE_DIR / "video_timecodes.json"
 TIMECODES_TXT = BASE_DIR / "video_timecodes.txt"
 TRANSCRIPT_JSON = BASE_DIR / "audio_transcript.json"       # кэш транскрипта
 
-# Выходной файл этапа 2.
+# Выходные файлы этапа 2.
 FINAL_VIDEO = BASE_DIR / "final_montage.mp4"
+PREVIEW_VIDEO = BASE_DIR / "final_montage_preview.mp4"
+
+# Режим предпросмотра: смонтировать только первые N секунд (чтобы быстро проверить
+# результат, не рендеря весь ролик и не нагружая машину). 0/пусто -> выключено.
+# Можно задать через env PREVIEW_SECONDS или флагом --preview [СЕКУНДЫ].
+_PREVIEW_ENV = os.getenv("PREVIEW_SECONDS", "").strip()
+PREVIEW_SECONDS_DEFAULT = 60.0
 
 # OpenAI ключ: сначала env, потом локальный файл. НИКОГДА не хардкодим.
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
@@ -481,7 +488,11 @@ def align_sentences_to_transcript(sentences: List[Sentence], tr: Transcript) -> 
             s_time[si] = t_words[ti].start
             matched += 1
 
-    coverage = matched / len(s_tokens)
+    # coverage = доля произнесённых слов, нашедших место в сценарии.
+    # Именно "качество распознавания речи в тексте", а не доля всего сценария —
+    # так метрика остаётся честной, даже если транскрибируется лишь часть аудио
+    # (например в режиме предпросмотра первой минуты).
+    coverage = matched / max(1, len(t_tokens))
 
     # 4) Заполняем пропуски линейной интерполяцией между известными точками.
     _interpolate_times(s_time)
@@ -939,7 +950,33 @@ def render_black(slot: float, w: int, h: int, out: Path) -> Optional[Path]:
     return out
 
 
-def render_montage(scenes: List[SceneTC]) -> None:
+def select_preview_scenes(scenes: List[SceneTC], preview_seconds: float) -> List[SceneTC]:
+    """
+    Оставляет только сцены, попадающие в окно [0, preview_seconds].
+    Пограничную сцену обрезает ровно по границе. Возвращает копии (оригиналы не трогаем).
+    """
+    selected: List[SceneTC] = []
+    for sc in scenes:
+        if sc.start >= preview_seconds:
+            break
+        clip = SceneTC(
+            global_scene_index=sc.global_scene_index,
+            block_id=sc.block_id,
+            scene_index_in_block=sc.scene_index_in_block,
+            sentence_indexes=list(sc.sentence_indexes),
+            block_text=sc.block_text,
+            subject=sc.subject,
+            video_file=sc.video_file,
+            anchor=sc.anchor,
+            start=sc.start,
+            end=min(sc.end, preview_seconds),
+            exists=sc.exists,
+        )
+        selected.append(clip)
+    return selected
+
+
+def render_montage(scenes: List[SceneTC], preview_seconds: Optional[float] = None) -> None:
     if not which("ffmpeg"):
         warn("ffmpeg не найден — монтаж пропущен. Тайм-коды сохранены, "
              "монтаж можно собрать позже, установив ffmpeg. (ffprobe необязателен.)")
@@ -949,6 +986,18 @@ def render_montage(scenes: List[SceneTC]) -> None:
     if not audio_path:
         warn("Нет аудио — монтаж без звука не имеет смысла, пропускаю.")
         return
+
+    out_video = FINAL_VIDEO
+    limit_seconds: Optional[float] = None
+    if preview_seconds and preview_seconds > 0:
+        if not scenes or scenes[0].start >= preview_seconds:
+            warn(f"В окне предпросмотра {preview_seconds:.0f}s нет ни одной сцены.")
+            return
+        full_count = len(scenes)
+        scenes = select_preview_scenes(scenes, preview_seconds)
+        limit_seconds = min(preview_seconds, scenes[-1].end)
+        out_video = PREVIEW_VIDEO
+        info(f"РЕЖИМ ПРЕДПРОСМОТРА: первые {limit_seconds:.1f}s — {len(scenes)} из {full_count} сцен.")
 
     w, h = parse_target_resolution(scenes)
     info(f"Рендер {len(scenes)} сегментов в {w}x{h}@{TARGET_FPS}, режим заполнения={FILL_MODE}")
@@ -1000,24 +1049,24 @@ def render_montage(scenes: List[SceneTC]) -> None:
             check=True, capture_output=True, text=True,
         )
 
-    # накладываем оригинальное аудио
+    # накладываем оригинальное аудио (в предпросмотре ограничиваем длину по -t)
+    mux_cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(silent_video),
+        "-i", str(audio_path),
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        "-shortest",
+    ]
+    if limit_seconds:
+        mux_cmd += ["-t", f"{limit_seconds:.3f}"]
+    mux_cmd.append(str(out_video))
     try:
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-i", str(silent_video),
-                "-i", str(audio_path),
-                "-map", "0:v:0", "-map", "1:a:0",
-                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-                "-shortest",
-                str(FINAL_VIDEO),
-            ],
-            check=True, capture_output=True, text=True,
-        )
+        subprocess.run(mux_cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
         fail(f"Не удалось наложить аудио: {e.stderr[:300]}")
 
-    info(f"[DONE] Готовый монтаж: {FINAL_VIDEO}")
+    info(f"[DONE] Готовый монтаж: {out_video}")
     info(f"Промежуточные файлы: {tmp_dir} (можно удалить).")
 
 
@@ -1033,7 +1082,20 @@ def main() -> None:
                         help="Только этап 1: посчитать и сохранить тайм-коды.")
     parser.add_argument("--render-only", action="store_true",
                         help="Только этап 2: собрать монтаж по готовому video_timecodes.json.")
+    parser.add_argument("--preview", nargs="?", type=float, const=PREVIEW_SECONDS_DEFAULT,
+                        default=None, metavar="СЕК",
+                        help="Смонтировать только первые N секунд (по умолчанию 60) в "
+                             "final_montage_preview.mp4 — быстрый тест без нагрузки. "
+                             "Тайм-коды считаются по всему аудио, полный монтаж не трогается.")
     args = parser.parse_args()
+
+    # Предпросмотр: приоритет у флага, иначе env PREVIEW_SECONDS.
+    preview_seconds: Optional[float] = args.preview
+    if preview_seconds is None and _PREVIEW_ENV:
+        try:
+            preview_seconds = float(_PREVIEW_ENV)
+        except ValueError:
+            warn(f"PREVIEW_SECONDS={_PREVIEW_ENV!r} — не число, игнорирую.")
 
     if args.render_only:
         payload = load_json(TIMECODES_JSON, None)
@@ -1055,14 +1117,14 @@ def main() -> None:
             for s in payload["scenes"]
         ]
         info(f"Загружены тайм-коды: {len(scenes)} сцен из {TIMECODES_JSON.name}")
-        render_montage(scenes)
+        render_montage(scenes, preview_seconds=preview_seconds)
         return
 
     scenes = build_timecodes()
     if args.timecodes_only:
         info("Готово (только тайм-коды). Для монтажа запусти с --render-only.")
         return
-    render_montage(scenes)
+    render_montage(scenes, preview_seconds=preview_seconds)
 
 
 if __name__ == "__main__":

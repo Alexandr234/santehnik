@@ -60,10 +60,20 @@ scenario.txt
 ```bash
 export OPENAI_API_KEY="sk-..."        # или положить ключ в ПРОМПТЫ/openai_key.txt
 
-python audio_video_sync_montage.py                    # тайм-коды + монтаж
+python audio_video_sync_montage.py                    # тайм-коды + полный монтаж
+python audio_video_sync_montage.py --preview           # ТЕСТ: только первая минута -> final_montage_preview.mp4
+python audio_video_sync_montage.py --preview 30        # тест первых 30 секунд
 python audio_video_sync_montage.py --timecodes-only   # только этап 1
 python audio_video_sync_montage.py --render-only       # только монтаж по video_timecodes.json
+python audio_video_sync_montage.py --render-only --preview   # быстрый превью-монтаж по готовым тайм-кодам
 ```
+
+**Режим предпросмотра (`--preview [СЕК]`, по умолчанию 60)** монтирует только
+первые N секунд в отдельный файл `final_montage_preview.mp4` — чтобы быстро
+проверить результат, не рендеря весь ролик и не нагружая машину. Тайм-коды при
+этом считаются по всему аудио (превью показывает реальный результат), а полный
+`final_montage.mp4` не перезаписывается. То же самое включается через
+`PREVIEW_SECONDS=60`.
 
 Нужен установленный **ffmpeg** (на macOS: `brew install ffmpeg`). Пакет `openai`
 уже используется в master-скрипте.
@@ -75,6 +85,7 @@ python audio_video_sync_montage.py --render-only       # только монта
 | `PROMPTS_BASE_DIR` | `/Users/aleksandrtomilov/Desktop/ПРОМПТЫ` | Базовая папка проекта |
 | `OPENAI_API_KEY` | — | Ключ для Whisper (или файл `openai_key.txt`) |
 | `WHISPER_MODEL` | `whisper-1` | Модель транскрибации |
+| `PREVIEW_SECONDS` | — | Смонтировать только первые N секунд (тест). Аналог `--preview` |
 | `CLIP_SECONDS` | `8` | Длина исходных роликов |
 | `MIN_SLOT_SECONDS` | `1.2` | Минимальная длина слота под ролик |
 | `FILL_MODE` | `freeze` | Заполнение длинного слота: `freeze`/`slow`/`loop` |
