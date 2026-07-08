@@ -895,8 +895,14 @@ PROMPT_USER_TEMPLATE = """
 - labels: пустая строка если текст внутри не нужен; если нужен — max 2 слова кириллицей (RU) или по-английски (EN)
 - Кадр иллюстрирует ТОЛЬКО текущую фразу, не следующую
 - Совет по типу кадра (hint_frame_type) — ориентир, но не обязаловка
+- ВСЕ кадры происходят в одном мире из STORY BRIEF: та же эпоха, те же строения, одежда, природа, технологии. НИКОГДА не добавляй современные объекты и анахронизмы, если их нет в брифе
+- Понимай неоднозначные слова по STORY BRIEF, а не буквально (например «стоянка» = стоянка первобытных людей у костра, а НЕ парковка машин; «сеть» = рыболовная сеть, а не интернет)
+- Держи визуальную непрерывность с соседними блоками (previous_text/next_text/semantic_group_text): если это та же сцена — сохраняй ту же локацию, тех же персонажей и окружение, меняй только действие или ракурс
 
 Язык: __LANGUAGE_NAME__ (__LANGUAGE_CODE__)
+
+STORY BRIEF (единый мир всего ролика — обязателен для каждого кадра):
+__STORY_BRIEF__
 
 Контекст предыдущего батча:
 __CONTINUITY_MEMORY__
@@ -1080,12 +1086,105 @@ def enforce_non_scene_balance(rows: list[PromptRow], language_code: str) -> list
     return new_rows
 
 
+STORY_BRIEF_SYSTEM_BY_LANG = {
+    "ru": """
+Ты — сценарист-редактор. По полному тексту озвучки составь короткую «библию мира» для художника,
+который будет рисовать кадры этого ролика. Верни ТОЛЬКО валидный JSON:
+{
+  "era_setting": "эпоха и место одной короткой строкой",
+  "world": "как выглядит мир: строения, одежда, природа, технологии (1-2 предложения)",
+  "characters": "главные повторяющиеся персонажи (роли, без имён реальных людей)",
+  "glossary": [{"word": "слово из текста", "meaning": "что оно значит именно в этом ролике"}],
+  "avoid": "что НЕЛЬЗЯ рисовать: анахронизмы, современные объекты и т.п."
+}
+Особое внимание — неоднозначным словам, которые художник может понять буквально или по-современному
+(например: «стоянка» = стоянка первобытных людей у костра, а не парковка машин; «сеть» = рыболовная сеть, а не интернет;
+«племя», «орудие», «очаг» и т.п.). В glossary добавь 3-8 таких слов из текста.
+Никаких имён реальных людей. Пиши кратко.
+""".strip(),
+    "en": """
+You are a script editor. From the full voiceover text, build a short "world bible" for the artist
+who will draw the frames of this video. Return ONLY valid JSON:
+{
+  "era_setting": "era and place in one short line",
+  "world": "how the world looks: buildings, clothing, nature, technology (1-2 sentences)",
+  "characters": "main recurring characters (roles, no real person names)",
+  "glossary": [{"word": "word from the text", "meaning": "what it means specifically in this video"}],
+  "avoid": "what must NOT be drawn: anachronisms, modern objects, etc."
+}
+Pay special attention to ambiguous words the artist might read literally or in a modern sense
+(e.g. "camp" = a prehistoric human campsite by a fire, not a parking lot; "net" = a fishing net, not the internet).
+Add 3-8 such words from the text to glossary. No real person names. Be concise.
+""".strip(),
+}
+
+
+def build_story_brief(client: OpenAI, blocks: list[VisualBlock], language_code: str) -> dict[str, str]:
+    """One-shot 'world bible' for the whole video: keeps every frame in the same era/world and
+    disambiguates tricky words (e.g. 'стоянка' = prehistoric campsite, not a car park).
+    Returns {"brief": <text injected into every batch>, "setting": <short SCENE_LOCK line>}."""
+    full_text = clean_text(" ".join(b.text for b in blocks))
+    if not full_text:
+        return {"brief": "", "setting": ""}
+    full_text = full_text[:12000]
+
+    try:
+        response = openai_call_with_retries(
+            lambda: client.chat.completions.create(
+                model=PROMPT_MODEL,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": STORY_BRIEF_SYSTEM_BY_LANG.get(language_code, STORY_BRIEF_SYSTEM_BY_LANG["en"])},
+                    {"role": "user", "content": f"Полный текст озвучки / Full voiceover text:\n\n{full_text}"},
+                ],
+            ),
+            description=f"story brief for {language_code.upper()}",
+        )
+        data = json.loads(response.choices[0].message.content or "{}")
+    except Exception as error:
+        print(f"WARNING: story brief for {language_code.upper()} failed: {error}. Continuing without it.")
+        return {"brief": "", "setting": ""}
+
+    era_setting = clean_text(data.get("era_setting", ""))
+    world = clean_text(data.get("world", ""))
+    characters = clean_text(data.get("characters", ""))
+    avoid = clean_text(data.get("avoid", ""))
+    glossary_items = data.get("glossary", []) or []
+    glossary_pairs = []
+    for item in glossary_items:
+        if isinstance(item, dict):
+            word = clean_text(item.get("word", ""))
+            meaning = clean_text(item.get("meaning", ""))
+            if word and meaning:
+                glossary_pairs.append(f"{word} = {meaning}")
+    glossary_text = "; ".join(glossary_pairs)
+
+    is_ru = language_code == "ru"
+    lines = []
+    if era_setting:
+        lines.append((f"- Эпоха/место: {era_setting}" if is_ru else f"- Era/place: {era_setting}"))
+    if world:
+        lines.append((f"- Мир: {world}" if is_ru else f"- World: {world}"))
+    if characters:
+        lines.append((f"- Персонажи: {characters}" if is_ru else f"- Characters: {characters}"))
+    if glossary_text:
+        lines.append((f"- Значения слов: {glossary_text}" if is_ru else f"- Word meanings: {glossary_text}"))
+    if avoid:
+        lines.append((f"- НЕ рисовать: {avoid}" if is_ru else f"- Do NOT draw: {avoid}"))
+
+    brief = "\n".join(lines) if lines else ("нет" if is_ru else "none")
+    print(f"Story brief for {language_code.upper()}: {era_setting or '(empty)'}")
+    return {"brief": brief, "setting": era_setting}
+
+
 def generate_prompts_for_batch(
     client: OpenAI,
     blocks: list[VisualBlock],
     language_code: str,
     memory: ContinuityMemory,
     semantic_group_map: dict[int, dict[str, Any]] | None = None,
+    story_brief: str = "",
 ) -> tuple[list[PromptRow], ContinuityMemory]:
     language = LANGUAGES.get(language_code, LANGUAGES["en"])
     language_name = language.get("name", language_code.upper())
@@ -1095,6 +1194,7 @@ def generate_prompts_for_batch(
         PROMPT_USER_TEMPLATE
         .replace("__LANGUAGE_CODE__", language_code)
         .replace("__LANGUAGE_NAME__", language_name)
+        .replace("__STORY_BRIEF__", story_brief or ("нет" if language_code == "ru" else "none"))
         .replace("__CONTINUITY_MEMORY__", continuity_memory_to_text(memory))
         .replace("__BLOCKS_JSON__", json.dumps(blocks_payload, ensure_ascii=False, indent=2))
     )
@@ -1166,6 +1266,7 @@ def generate_prompts(
     language_code: str,
     batch_size: int = 18,
     prompt_workers: int = DEFAULT_PROMPT_WORKERS,
+    story_brief: str = "",
 ) -> list[PromptRow]:
     groups = build_semantic_groups(blocks)
     semantic_group_map = build_semantic_group_map(groups)
@@ -1180,7 +1281,9 @@ def generate_prompts(
         memory = ContinuityMemory()
         for batch in batches:
             print(f"Generating {language_code.upper()} prompts {batch[0].index}-{batch[-1].index}...")
-            batch_rows, memory = generate_prompts_for_batch(client, batch, language_code, memory, semantic_group_map)
+            batch_rows, memory = generate_prompts_for_batch(
+                client, batch, language_code, memory, semantic_group_map, story_brief,
+            )
             rows.extend(batch_rows)
         return sorted(rows, key=lambda r: r.index)
 
@@ -1191,7 +1294,7 @@ def generate_prompts(
         for batch in batches:
             print(f"Queue {language_code.upper()} prompts {batch[0].index}-{batch[-1].index}...")
             futures[executor.submit(
-                generate_prompts_for_batch, client, batch, language_code, ContinuityMemory(), semantic_group_map,
+                generate_prompts_for_batch, client, batch, language_code, ContinuityMemory(), semantic_group_map, story_brief,
             )] = (batch[0].index, batch[-1].index)
         for future in as_completed(futures):
             s, e = futures[future]
@@ -1300,6 +1403,7 @@ def write_outputs(
     root_output_dir: Path,
     target_seconds: float,
     write_root_copies: bool = True,
+    story_setting: str = "",
 ) -> None:
     language_name = LANGUAGES.get(language_code, {}).get("name", language_code.upper())
     paths = expected_output_paths(input_path, language_code, language_dir, root_output_dir)
@@ -1324,10 +1428,15 @@ def write_outputs(
                 "scene_prompt": r.scene_prompt, "labels": r.labels, "image_prompt": r.image_prompt,
             })
 
+    story_setting = clean_text(story_setting)
     txt_lines: list[str] = []
     for r in rows:
         txt_lines.append(f"{r.index:03d} | {seconds_to_srt_time(r.start)} --> {seconds_to_srt_time(r.end)} | {r.duration:.2f}s | {r.frame_type}")
         txt_lines.append(f"TEXT: {r.text}")
+        # SCENE_LOCK carries the whole video's era/world into the image generator,
+        # so it keeps the same setting/palette across frames instead of jumping context.
+        if story_setting:
+            txt_lines.append(f"SCENE_LOCK: {story_setting}")
         if r.labels:
             txt_lines.append(f"LABELS: {r.labels}")
         txt_lines.append(r.image_prompt)
@@ -1479,11 +1588,15 @@ def process_file(
         raise RuntimeError(f"No transcription segments for {input_path}")
 
     blocks = build_visual_blocks(segments, target_seconds=target_seconds)
-    rows = generate_prompts(client, blocks, language_code, prompt_workers=prompt_workers)
+    story = build_story_brief(client, blocks, language_code)
+    rows = generate_prompts(
+        client, blocks, language_code, prompt_workers=prompt_workers, story_brief=story["brief"],
+    )
     write_outputs(
         input_path=input_path, language_code=language_code, segments=segments,
         blocks=blocks, rows=rows, language_dir=language_dir, root_output_dir=root_output_dir,
         target_seconds=target_seconds, write_root_copies=write_root_copies,
+        story_setting=story["setting"],
     )
 
 
