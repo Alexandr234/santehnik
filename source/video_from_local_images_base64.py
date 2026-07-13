@@ -111,6 +111,24 @@ RATE_WINDOW_SECONDS = 3600
 
 RETRY_SLEEP_429 = [20, 35, 60, 90]
 
+# Ёмкостные/аккаунтные ошибки провайдера ("нет доступных аккаунтов" / "no available accounts")
+# — это НЕ блок по контенту, а занятый пул аккаунтов flower. Повторяем терпеливо и долго.
+CAPACITY_ERROR_MARKERS = (
+    "no available account", "no accounts available", "no available accounts",
+    "no free account", "all accounts", "account pool", "no account",
+    "нет доступных аккаунт", "нет свободных аккаунт", "нет аккаунт",
+    "try again later", "temporarily unavailable", "over capacity", "overloaded",
+    "no capacity", "capacity", "please try again",
+)
+CAPACITY_RETRIES = max(1, int(os.getenv("FAST_GEN_CAPACITY_RETRIES", "40")))
+CAPACITY_SLEEP_START = int(os.getenv("FAST_GEN_CAPACITY_BACKOFF_START_SEC", "15"))
+CAPACITY_SLEEP_CAP = int(os.getenv("FAST_GEN_CAPACITY_BACKOFF_CAP_SEC", "120"))
+
+
+def is_capacity_error(text: str) -> bool:
+    low = str(text).lower()
+    return any(marker in low for marker in CAPACITY_ERROR_MARKERS)
+
 # Если отдельного промпта для картинки нет, будет использоваться этот.
 DEFAULT_ANIMATION_PROMPT = (
     "Animate this image with gentle realistic motion, subtle cinematic camera movement, "
@@ -185,15 +203,19 @@ def validate_aspect_ratio(aspect_ratio: str) -> str:
 
 def request_with_retries(method: str, url: str, **kwargs) -> requests.Response:
     last_error: Optional[Exception] = None
+    attempt = 0            # обычные попытки (сеть/5xx) — ограничены MAX_RETRIES
+    cap_attempt = 0        # ёмкостные ("нет аккаунтов") — отдельный, большой бюджет
+    cap_delay = float(CAPACITY_SLEEP_START)
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    while attempt < MAX_RETRIES:
         try:
             resp = requests.request(method, url, timeout=REQUEST_TIMEOUT, **kwargs)
 
             if resp.status_code == 429:
                 body = safe_json(resp)
-                sleep_for = RETRY_SLEEP_429[min(attempt - 1, len(RETRY_SLEEP_429) - 1)]
-                log(f"[WARN] Попытка {attempt}/{MAX_RETRIES} не удалась: HTTP 429 for {url}: {body}")
+                sleep_for = RETRY_SLEEP_429[min(attempt, len(RETRY_SLEEP_429) - 1)]
+                log(f"[WARN] HTTP 429 for {url}: {body}")
+                attempt += 1
                 if attempt < MAX_RETRIES:
                     time.sleep(sleep_for)
                     continue
@@ -205,12 +227,31 @@ def request_with_retries(method: str, url: str, **kwargs) -> requests.Response:
 
             if 400 <= resp.status_code < 500:
                 body = safe_json(resp)
+                # "Нет доступных аккаунтов" — не контент, а занятый пул: ждём терпеливо,
+                # НЕ тратя обычный бюджет попыток.
+                if is_capacity_error(json.dumps(body, ensure_ascii=False)):
+                    cap_attempt += 1
+                    if cap_attempt <= CAPACITY_RETRIES:
+                        log(f"[CAPACITY] нет свободных аккаунтов провайдера "
+                            f"({cap_attempt}/{CAPACITY_RETRIES}) — жду {int(cap_delay)}с и повторю")
+                        time.sleep(cap_delay)
+                        cap_delay = min(cap_delay * 1.5, CAPACITY_SLEEP_CAP)
+                        continue
                 raise RuntimeError(f"HTTP {resp.status_code} for {url}: {body}")
 
             return resp
 
         except Exception as e:
             last_error = e
+            # Ёмкостные ошибки, всплывшие как исключение, тоже ждём терпеливо.
+            if is_capacity_error(str(e)) and cap_attempt < CAPACITY_RETRIES:
+                cap_attempt += 1
+                log(f"[CAPACITY] нет свободных аккаунтов провайдера "
+                    f"({cap_attempt}/{CAPACITY_RETRIES}) — жду {int(cap_delay)}с и повторю")
+                time.sleep(cap_delay)
+                cap_delay = min(cap_delay * 1.5, CAPACITY_SLEEP_CAP)
+                continue
+            attempt += 1
             if attempt < MAX_RETRIES:
                 log(f"[WARN] Попытка {attempt}/{MAX_RETRIES} не удалась: {e}")
                 time.sleep(2 + attempt * 3)

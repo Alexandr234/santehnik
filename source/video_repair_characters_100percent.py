@@ -122,6 +122,12 @@ EXTRA_GUARANTEED_ROUNDS = int(os.getenv("FAST_GEN_EXTRA_GUARANTEED_ROUNDS", "6")
 TRANSIENT_RETRIES = max(1, int(os.getenv("FAST_GEN_TRANSIENT_RETRIES", "5")))
 BACKOFF_CAP_SEC = int(os.getenv("FAST_GEN_BACKOFF_CAP_SEC", "90"))
 
+# Ёмкостные ошибки ("нет доступных аккаунтов") повторяем ДОЛЬШЕ и терпеливее — это не контент,
+# а занятый пул аккаунтов провайдера. Тот же промпт, длинная пауза, много попыток.
+CAPACITY_RETRIES = max(1, int(os.getenv("FAST_GEN_CAPACITY_RETRIES", "40")))
+CAPACITY_BACKOFF_START_SEC = int(os.getenv("FAST_GEN_CAPACITY_BACKOFF_START_SEC", "15"))
+CAPACITY_BACKOFF_CAP_SEC = int(os.getenv("FAST_GEN_CAPACITY_BACKOFF_CAP_SEC", "120"))
+
 MAX_VIDEO_WORKERS = int(os.getenv("FAST_GEN_VIDEO_WORKERS", "6"))
 MAX_IMAGE_WORKERS = int(os.getenv("FAST_GEN_IMAGE_WORKERS", "6"))
 
@@ -203,6 +209,17 @@ PERMANENT_ERROR_MARKERS = (
     "prohibited", "not allowed", "violat",
 )
 
+# Ёмкостные/аккаунтные ошибки провайдера — это НЕ блок по контенту, а "сейчас нет свободного
+# аккаунта / попробуйте позже". Их надо ТЕРПЕЛИВО повторять на ТОМ ЖЕ промпте (не эскалировать
+# и не переделывать картинку). Покрываем англ. и рус. формулировки (в т.ч. translations.ru).
+CAPACITY_ERROR_MARKERS = (
+    "no available account", "no accounts available", "no available accounts",
+    "no free account", "all accounts", "account pool", "no account",
+    "нет доступных аккаунт", "нет свободных аккаунт", "нет аккаунт",
+    "try again later", "temporarily unavailable", "over capacity", "overloaded",
+    "no capacity", "capacity", "please try again",
+)
+
 RISKY_REPLACEMENTS = [
     (re.compile(r"\bblood[a-z]*\b", re.I), ""),
     (re.compile(r"\bgore?\b", re.I), ""),
@@ -268,13 +285,25 @@ class TransientError(Exception):
     """сеть / 429 / 5xx — можно повторить."""
 
 
+class CapacityError(TransientError):
+    """провайдер: нет свободного аккаунта / попробуйте позже — повторять терпеливо, тот же промпт."""
+
+
 def log(message: str) -> None:
     with print_lock:
         print(message, flush=True)
 
 
-def classify_error_message(message: str) -> bool:
+def is_capacity_error(message: str) -> bool:
     low = str(message).lower()
+    return any(marker in low for marker in CAPACITY_ERROR_MARKERS)
+
+
+def classify_error_message(message: str) -> bool:
+    """True -> постоянная (safety) ошибка. Ёмкостные ошибки постоянными НЕ считаем."""
+    low = str(message).lower()
+    if is_capacity_error(low):
+        return False
     return any(marker in low for marker in PERMANENT_ERROR_MARKERS)
 
 
@@ -652,6 +681,8 @@ def request_post(url: str, payload: dict) -> dict:
             if resp.status_code == 429:
                 raise TransientError(f"429: {resp.text[:200]}")
             if 400 <= resp.status_code < 500:
+                if is_capacity_error(resp.text):
+                    raise CapacityError(f"HTTP {resp.status_code} (нет свободных аккаунтов): {resp.text[:200]}")
                 raise PermanentError(f"HTTP {resp.status_code}: {resp.text[:200]}")
             if resp.status_code >= 500:
                 raise TransientError(f"HTTP {resp.status_code}: {resp.text[:200]}")
@@ -675,6 +706,8 @@ def request_get(url: str) -> dict:
             if resp.status_code == 429:
                 raise TransientError(f"429: {resp.text[:200]}")
             if 400 <= resp.status_code < 500:
+                if is_capacity_error(resp.text):
+                    raise CapacityError(f"HTTP {resp.status_code} (нет свободных аккаунтов): {resp.text[:200]}")
                 raise PermanentError(f"HTTP {resp.status_code}: {resp.text[:200]}")
             if resp.status_code >= 500:
                 raise TransientError(f"HTTP {resp.status_code}: {resp.text[:200]}")
@@ -747,8 +780,14 @@ def poll_generation(generation_id: str, tag: str) -> Dict[str, Any]:
         if status in ("succeeded", "success", "completed", "done"):
             return data
         if status in ("failed", "error", "cancelled", "canceled"):
+            # translations.ru тоже учитываем — "нет доступных аккаунтов" приходит именно там.
+            translations = data.get("translations") or {}
+            tr_text = " ".join(str(v) for v in translations.values()) if isinstance(translations, dict) else ""
             error_str = str(data.get("error") or data)
-            if classify_error_message(error_str):
+            combined = f"{error_str} {tr_text}"
+            if is_capacity_error(combined):
+                raise CapacityError(f"{tag}: нет свободных аккаунтов провайдера: {error_str[:300]}")
+            if classify_error_message(combined):
                 raise PermanentError(f"{tag} заблокировано: {error_str[:300]}")
             raise TransientError(f"{tag} ошибка: {error_str[:300]}")
         time.sleep(POLL_INTERVAL)
@@ -762,6 +801,8 @@ def generate_video_once(prompt: str, image_data_uri: str, out_path: Path) -> str
     data = request_post(url, build_video_payload(prompt, image_data_uri))
     generation_id = extract_generation_id(data)
     if not generation_id:
+        if is_capacity_error(json.dumps(data, ensure_ascii=False)):
+            raise CapacityError(f"нет свободных аккаунтов провайдера (video): {data}")
         raise PermanentError(f"API не вернул generation id (video): {data}")
     result = poll_generation(generation_id, out_path.name)
     save_video_from_source(extract_media_source(result, "data:video/"), out_path)
@@ -774,6 +815,8 @@ def generate_image_once(prompt: str, out_path: Path) -> str:
     data = request_post(url, build_image_payload(prompt))
     generation_id = extract_generation_id(data)
     if not generation_id:
+        if is_capacity_error(json.dumps(data, ensure_ascii=False)):
+            raise CapacityError(f"нет свободных аккаунтов провайдера (image): {data}")
         raise PermanentError(f"API не вернул generation id (image): {data}")
     result = poll_generation(generation_id, out_path.name)
     save_image_from_source(extract_media_source(result, "data:image/"), out_path)
@@ -789,16 +832,31 @@ def _attempt(once_fn, out_path: Path, retries: Optional[int]) -> str:
     """
     retries = retries or TRANSIENT_RETRIES
     delay = float(RETRY_DELAY_SEC)
+    cap_left = CAPACITY_RETRIES              # отдельный, БОЛЬШОЙ бюджет для ёмкостных ошибок
+    cap_delay = float(CAPACITY_BACKOFF_START_SEC)
     last_error: Optional[Exception] = None
-    for i in range(1, retries + 1):
+    i = 0
+    while i < retries:
         try:
             return once_fn()
+        except CapacityError as e:
+            # Нет свободного аккаунта провайдера — это НЕ контент. Ждём терпеливо на ТОМ ЖЕ
+            # промпте и НЕ тратим обычный бюджет (i не растёт), пока не кончится cap_left.
+            last_error = e
+            cap_left -= 1
+            if cap_left <= 0:
+                break
+            log(f"      [capacity] нет свободных аккаунтов провайдера: {e} — жду {int(cap_delay)}с и повторю (тот же промпт)")
+            time.sleep(cap_delay)
+            cap_delay = min(cap_delay * 1.5, CAPACITY_BACKOFF_CAP_SEC)
+            continue
         except PermanentError:
             raise
         except KeyboardInterrupt:
             raise
         except Exception as e:
             last_error = e
+            i += 1
             if i < retries:
                 log(f"      временная ошибка {i}/{retries}: {e} — повтор через {int(delay)}с")
                 time.sleep(delay)
