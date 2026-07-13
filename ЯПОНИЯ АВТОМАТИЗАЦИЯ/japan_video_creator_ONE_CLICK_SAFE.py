@@ -40,8 +40,8 @@ ONE-CLICK SAFE semantic montage for ЯПОНИЯ АВТОМАТИЗАЦИЯ.
 
 5) Видеоряд:
    - только картинки;
-   - без первых двух видео;
-   - без зума;
+   - БЕЗ кликов мыши (полностью убраны);
+   - с плавным зумом (эффект Кена Бёрнса) на каждом кадре;
    - без переходов;
    - по абсолютным таймкодам;
    - паузы между фразами закрываются предыдущей картинкой.
@@ -65,14 +65,12 @@ import argparse
 import csv
 import math
 import os
-import random
 import re
 import subprocess
 import shlex
 import sys
 import tempfile
 import time
-import wave
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -101,9 +99,6 @@ except ImportError:
 
 
 AUDIO_DIR = PROJECT_ROOT / "ОЗВУЧКА"
-CLICK_SOUND_PATH = PROJECT_ROOT / "МОНТАЖ" / "МЫШЬ.MP3"
-CLICK_EVERY_SEGMENTS = 3
-CLICK_VOLUME = 1.0  # оригинальная громкость клика; голос не трогаем
 VISUAL_ROOT_DIR = PROJECT_ROOT / "ВИЗУАЛ"
 PROMPTS_DIR = PROJECT_ROOT / "ПРОМПТЫ"
 OUTPUT_VIDEO_DIR = PROJECT_ROOT / "ГОТОВЫЕ ВИДЕО"
@@ -127,6 +122,12 @@ VIDEO_BITRATE = "5M"
 PIXEL_FORMAT = "yuv420p"
 AUDIO_CODEC = "aac"
 AUDIO_BITRATE = "192k"
+
+# ЗУМ (эффект Кена Бёрнса): плавное приближение/отдаление на каждом кадре.
+# Клики полностью убраны, вместо них — живой медленный зум.
+ZOOM_ENABLED = True
+ZOOM_MAX = 1.12                 # максимальное приближение к краю кадра (1.12 = +12%)
+ZOOM_ALTERNATE_DIRECTION = True  # чередовать: один кадр приближение, следующий отдаление
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -166,13 +167,6 @@ class Segment:
     voice_text: str
     image_name_from_times: str
     resolved_by: str
-
-
-@dataclass
-class ClickEvent:
-    group_number: int
-    after_segment_index: int
-    time: float
 
 
 def log(msg: str) -> None:
@@ -728,6 +722,32 @@ def resize_cover(frame, target_w: int, target_h: int):
     return resized[y1:y1 + target_h, x1:x1 + target_w]
 
 
+def zoom_frame(base, t: float, zoom_in: bool):
+    """
+    Возвращает кадр с эффектом плавного зума (Кен Бёрнс).
+    base — уже приведённая к размеру TARGET картинка (cover).
+    t — прогресс внутри кадра, 0.0 → 1.0.
+    zoom_in=True:  плавно приближаем (1.0 → ZOOM_MAX).
+    zoom_in=False: плавно отдаляем (ZOOM_MAX → 1.0).
+    """
+    if not ZOOM_ENABLED or ZOOM_MAX <= 1.0:
+        return base
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    span = ZOOM_MAX - 1.0
+    z = (1.0 + span * t) if zoom_in else (ZOOM_MAX - span * t)
+
+    h, w = base.shape[:2]
+    # Размер центрального кропа, который потом растягиваем обратно до полного кадра.
+    cw = max(1, int(round(w / z)))
+    ch = max(1, int(round(h / z)))
+    x1 = (w - cw) // 2
+    y1 = (h - ch) // 2
+    crop = base[y1:y1 + ch, x1:x1 + cw]
+    if cw == w and ch == h:
+        return base
+    return cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 def write_frame(proc, frame, count: int) -> int:
     if count <= 0:
         return 0
@@ -740,7 +760,7 @@ def write_frame(proc, frame, count: int) -> int:
 def render_visual_track(segments: list[Segment], output_path: Path, total_duration: float, codec: str) -> float:
     total_frames = max(1, int(round(total_duration * FPS)))
     log(f"🎬 Старт рендера временного видео без аудио: {output_path}")
-    log(f"Параметры видеорендера: duration={total_duration:.3f}s, fps={FPS}, frames={total_frames}, codec={codec}, size={TARGET_WIDTH}x{TARGET_HEIGHT}")
+    log(f"Параметры видеорендера: duration={total_duration:.3f}s, fps={FPS}, frames={total_frames}, codec={codec}, size={TARGET_WIDTH}x{TARGET_HEIGHT}, zoom={'ON' if ZOOM_ENABLED else 'OFF'} (max={ZOOM_MAX})")
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-f", "rawvideo",
@@ -763,39 +783,52 @@ def render_visual_track(segments: list[Segment], output_path: Path, total_durati
 
     cache = {}
     current_frame = 0
-    prev_frame = None
+    prev_written = None  # последний реально записанный кадр (для пауз/хвоста)
     written = 0
 
-    def get_frame(path: Path):
+    def get_base(path: Path):
         if path not in cache:
             cache[path] = resize_cover(read_image_unicode(path), TARGET_WIDTH, TARGET_HEIGHT)
         return cache[path]
 
     try:
         with tqdm(total=total_frames, desc=f"Рендер {output_path.stem}", unit="frame") as pbar:
-            for s in sorted(segments, key=lambda x: (x.start, x.index)):
+            for seg_i, s in enumerate(sorted(segments, key=lambda x: (x.start, x.index))):
                 start_f = max(0, int(round(s.start * FPS)))
                 end_f = min(total_frames, max(start_f + 1, int(round(s.end * FPS))))
-                frame = get_frame(s.path)
+                base = get_base(s.path)
+                # Чередуем направление зума от кадра к кадру, если включено.
+                zoom_in = True if not ZOOM_ALTERNATE_DIRECTION else (seg_i % 2 == 0)
 
+                # Пауза перед началом сегмента закрывается замороженным предыдущим кадром.
                 if start_f > current_frame:
-                    hold = prev_frame if prev_frame is not None else frame
-                    n = write_frame(proc, hold, start_f - current_frame)
-                    current_frame += n
-                    written += n
-                    pbar.update(n)
+                    hold = prev_written if prev_written is not None else zoom_frame(base, 0.0, zoom_in)
+                    for _ in range(start_f - current_frame):
+                        proc.stdin.write(hold.tobytes())
+                    written += start_f - current_frame
+                    pbar.update(start_f - current_frame)
+                    current_frame = start_f
 
-                n = write_frame(proc, frame, max(0, end_f - current_frame))
-                current_frame += n
-                written += n
-                pbar.update(n)
-                prev_frame = frame
+                seg_frames = max(1, end_f - start_f)
+                # Собственные кадры сегмента: применяем плавный зум по прогрессу.
+                while current_frame < end_f:
+                    local = current_frame - start_f
+                    t = local / max(1, seg_frames - 1)
+                    fr = zoom_frame(base, t, zoom_in)
+                    proc.stdin.write(fr.tobytes())
+                    prev_written = fr
+                    written += 1
+                    current_frame += 1
+                    pbar.update(1)
 
+            # Хвост до конца аудио — держим последний кадр замороженным.
             if current_frame < total_frames:
-                hold = prev_frame if prev_frame is not None else get_frame(segments[-1].path)
-                n = write_frame(proc, hold, total_frames - current_frame)
-                written += n
-                pbar.update(n)
+                if prev_written is None:
+                    prev_written = zoom_frame(get_base(segments[-1].path), 0.0, True)
+                for _ in range(total_frames - current_frame):
+                    proc.stdin.write(prev_written.tobytes())
+                written += total_frames - current_frame
+                pbar.update(total_frames - current_frame)
 
         proc.stdin.close()
         err = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
@@ -819,71 +852,6 @@ def render_with_fallback(segments: list[Segment], output_path: Path, total_durat
         return render_visual_track(segments, output_path, total_duration, VIDEO_CODEC_FALLBACK)
 
 
-def collect_random_click_events(
-    segments: list[Segment],
-    total_duration: float,
-    every_segments: int = CLICK_EVERY_SEGMENTS,
-    seed: Optional[int] = None,
-) -> list[ClickEvent]:
-    """
-    Делает один клик на каждую группу из 3 визуальных кадров.
-
-    Пример для группы из трех кадров:
-    - КАДР клик КАДР КАДР   -> клик после 1-го кадра;
-    - КАДР КАДР клик КАДР   -> клик после 2-го кадра;
-    - КАДР КАДР КАДР клик   -> клик после 3-го кадра.
-
-    Здесь "кадр" — это один Segment из image_times, а не 1/25 секунды видео.
-    """
-    if every_segments <= 0 or not segments:
-        return []
-
-    rng = random.Random(seed) if seed is not None else random.SystemRandom()
-    events: list[ClickEvent] = []
-    ordered = sorted(segments, key=lambda x: (x.start, x.index))
-
-    for group_start in range(0, len(ordered), every_segments):
-        group = ordered[group_start:group_start + every_segments]
-        if not group:
-            continue
-
-        chosen_pos = rng.randrange(len(group))
-        chosen_segment = group[chosen_pos]
-        click_time = min(max(0.0, chosen_segment.end), max(0.0, total_duration - 0.001))
-
-        # Не ставим клик ровно в самый конец, если последний сегмент упирается в конец аудио.
-        if click_time >= total_duration:
-            click_time = max(0.0, total_duration - 0.05)
-
-        events.append(
-            ClickEvent(
-                group_number=(group_start // every_segments) + 1,
-                after_segment_index=chosen_segment.index,
-                time=click_time,
-            )
-        )
-
-    return events
-
-
-def write_click_manifest(lang: str, events: list[ClickEvent]) -> Path:
-    out = OUTPUT_VIDEO_DIR / f"{lang}_random_mouse_clicks_manifest.csv"
-    with out.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=["group_number", "after_segment_index", "click_time", "click_time_seconds"],
-        )
-        w.writeheader()
-        for e in events:
-            w.writerow({
-                "group_number": e.group_number,
-                "after_segment_index": e.after_segment_index,
-                "click_time": seconds_to_timecode(e.time),
-                "click_time_seconds": f"{e.time:.3f}",
-            })
-    return out
-
-
 def mux_audio_plain(visual_path: Path, audio_path: Path, output_path: Path, duration: float) -> None:
     log(f"🎧 Старт финальной склейки БЕЗ кликов: video={visual_path.name}, audio={audio_path.name}, out={output_path.name}")
     cmd = [
@@ -904,327 +872,12 @@ def mux_audio_plain(visual_path: Path, audio_path: Path, output_path: Path, dura
 
 
 
-def read_pcm16_wav(path: Path) -> tuple[int, int, np.ndarray]:
-    """
-    Читает WAV PCM16 и возвращает: sample_rate, channels, samples[int16].
-    """
-    with wave.open(str(path), "rb") as wf:
-        channels = wf.getnchannels()
-        sample_rate = wf.getframerate()
-        sample_width = wf.getsampwidth()
-        frames = wf.getnframes()
-        raw = wf.readframes(frames)
-
-    if sample_width != 2:
-        raise RuntimeError(f"Ожидался WAV PCM16, но sample_width={sample_width}: {path}")
-
-    samples = np.frombuffer(raw, dtype=np.int16)
-    if channels > 1:
-        samples = samples.reshape(-1, channels)
-    else:
-        samples = samples.reshape(-1, 1)
-    return sample_rate, channels, samples
-
-
-def write_pcm16_wav(path: Path, sample_rate: int, samples: np.ndarray) -> None:
-    """
-    Пишет samples[int16] в WAV PCM16.
-    """
-    if samples.dtype != np.int16:
-        samples = samples.astype(np.int16)
-    if samples.ndim == 1:
-        samples = samples.reshape(-1, 1)
-    channels = samples.shape[1]
-    with wave.open(str(path), "wb") as wf:
-        wf.setnchannels(channels)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(samples.tobytes())
-
-
-def decode_click_to_wav(click_sound_path: Path, decoded_wav_path: Path, sample_rate: int = 48000, channels: int = 2) -> None:
-    """
-    Один раз декодирует МЫШЬ.MP3 в короткий WAV PCM16.
-    Так Python потом быстро раскладывает клики по таймлайну.
-    """
-    log(f"🔊 Декодирую файл клика в WAV PCM16: {click_sound_path.name} -> {decoded_wav_path.name}")
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "info", "-stats",
-        "-i", str(click_sound_path),
-        "-vn",
-        "-ac", str(channels),
-        "-ar", str(sample_rate),
-        "-acodec", "pcm_s16le",
-        str(decoded_wav_path),
-    ]
-    run_subprocess_verbose(cmd, f"FFmpeg decode click {click_sound_path.name}")
-
-
-def build_click_track_wav(
-    click_sound_path: Path,
-    click_track_path: Path,
-    click_delays_ms: list[int],
-    duration: float,
-    sample_rate: int = 48000,
-    channels: int = 2,
-) -> None:
-    """
-    Быстрый способ добавить много кликов:
-    1) декодируем один короткий клик в WAV;
-    2) в Python создаём одну длинную WAV-дорожку тишины;
-    3) накладываем в неё все клики;
-    4) потом FFmpeg смешивает только голос + ОДНУ дорожку кликов.
-
-    Это заменяет старый тяжёлый вариант с asplit=119 / adelay=119 / amix=120.
-    """
-    decoded_click_path = click_track_path.with_name(click_track_path.stem + "__single_click_decoded.wav")
-    decode_click_to_wav(click_sound_path, decoded_click_path, sample_rate=sample_rate, channels=channels)
-
-    click_sr, click_channels, click_samples = read_pcm16_wav(decoded_click_path)
-    if click_sr != sample_rate:
-        raise RuntimeError(f"Неожиданный sample_rate клика: {click_sr}, ожидался {sample_rate}")
-    if click_channels != channels:
-        raise RuntimeError(f"Неожиданное число каналов клика: {click_channels}, ожидалось {channels}")
-
-    if CLICK_VOLUME != 1.0:
-        click_samples = np.clip(click_samples.astype(np.float32) * float(CLICK_VOLUME), -32768, 32767).astype(np.int16)
-
-    total_samples = max(1, int(math.ceil(duration * sample_rate)))
-    log(
-        f"🧱 Создаю одну WAV-дорожку кликов: duration={duration:.3f}s, "
-        f"sample_rate={sample_rate}, channels={channels}, samples={total_samples}, clicks={len(click_delays_ms)}"
-    )
-    log(f"Размер дорожки кликов в памяти примерно: {total_samples * channels * 2 / 1024 / 1024:.1f} MB")
-
-    track = np.zeros((total_samples, channels), dtype=np.int16)
-    click_len = click_samples.shape[0]
-    placed = 0
-    skipped = 0
-
-    for delay_ms in click_delays_ms:
-        start_sample = int(round(delay_ms * sample_rate / 1000.0))
-        if start_sample >= total_samples:
-            skipped += 1
-            continue
-        end_sample = min(total_samples, start_sample + click_len)
-        part_len = end_sample - start_sample
-        if part_len <= 0:
-            skipped += 1
-            continue
-
-        # Складываем с защитой от клиппинга.
-        mixed = track[start_sample:end_sample].astype(np.int32) + click_samples[:part_len].astype(np.int32)
-        np.clip(mixed, -32768, 32767, out=mixed)
-        track[start_sample:end_sample] = mixed.astype(np.int16)
-        placed += 1
-
-    write_pcm16_wav(click_track_path, sample_rate, track)
-    size = click_track_path.stat().st_size if click_track_path.exists() else 0
-    log(f"✅ WAV-дорожка кликов готова: {click_track_path} | placed={placed}, skipped={skipped}, size={size} bytes")
-
-
-
-def decode_audio_to_pcm16_wav(
-    input_audio_path: Path,
-    output_wav_path: Path,
-    duration: float,
-    sample_rate: int = 48000,
-    channels: int = 2,
-) -> None:
-    """
-    Декодирует основную озвучку в WAV PCM16 с фиксированными параметрами.
-    Это убирает проблему FFmpeg, когда MP3 mono/stereo меняет параметры в середине filter graph.
-    """
-    log(f"🎙️ Декодирую основную озвучку в WAV PCM16: {input_audio_path.name} -> {output_wav_path.name}")
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "info", "-stats",
-        "-i", str(input_audio_path),
-        "-vn",
-        "-ac", str(channels),
-        "-ar", str(sample_rate),
-        "-t", f"{duration:.3f}",
-        "-acodec", "pcm_s16le",
-        str(output_wav_path),
-    ]
-    run_subprocess_verbose(cmd, f"FFmpeg decode voice {input_audio_path.name}")
-
-
-def build_mixed_voice_clicks_wav(
-    audio_path: Path,
-    click_sound_path: Path,
-    mixed_audio_path: Path,
-    click_delays_ms: list[int],
-    duration: float,
-    work_dir: Path,
-    sample_rate: int = 48000,
-    channels: int = 2,
-) -> None:
-    """
-    Самая надёжная схема:
-    1) декодируем голос в WAV PCM16;
-    2) декодируем один клик в WAV PCM16;
-    3) прямо в Python накладываем клики на голос;
-    4) получаем ОДНУ финальную WAV-дорожку.
-
-    После этого FFmpeg ничего не смешивает через amix — он только кладёт готовый WAV под видео.
-    Поэтому звук не должен пропадать после минуты и не должен зависать на filter_complex.
-    """
-    voice_wav = work_dir / "voice_decoded_48000_stereo.wav"
-    click_wav = work_dir / "single_click_decoded_48000_stereo.wav"
-
-    decode_audio_to_pcm16_wav(audio_path, voice_wav, duration, sample_rate=sample_rate, channels=channels)
-    decode_click_to_wav(click_sound_path, click_wav, sample_rate=sample_rate, channels=channels)
-
-    voice_sr, voice_channels, voice_samples = read_pcm16_wav(voice_wav)
-    click_sr, click_channels, click_samples = read_pcm16_wav(click_wav)
-
-    if voice_sr != sample_rate or voice_channels != channels:
-        raise RuntimeError(f"Голос декодировался не так: sr={voice_sr}, channels={voice_channels}")
-    if click_sr != sample_rate or click_channels != channels:
-        raise RuntimeError(f"Клик декодировался не так: sr={click_sr}, channels={click_channels}")
-
-    total_samples = max(1, int(math.ceil(duration * sample_rate)))
-
-    # Выравниваем голос строго под длину видео/аудио.
-    if voice_samples.shape[0] < total_samples:
-        pad = np.zeros((total_samples - voice_samples.shape[0], channels), dtype=np.int16)
-        voice_samples = np.vstack([voice_samples, pad])
-    elif voice_samples.shape[0] > total_samples:
-        voice_samples = voice_samples[:total_samples]
-
-    log(
-        f"🧩 Миксую голос + клики в Python: duration={duration:.3f}s, "
-        f"sample_rate={sample_rate}, channels={channels}, total_samples={total_samples}, clicks={len(click_delays_ms)}"
-    )
-    log(f"Размер рабочей аудиодорожки в памяти примерно: {total_samples * channels * 2 / 1024 / 1024:.1f} MB")
-
-    mixed = voice_samples.astype(np.int32, copy=True)
-    click = click_samples.astype(np.int32)
-    if CLICK_VOLUME != 1.0:
-        click = np.clip(click.astype(np.float32) * float(CLICK_VOLUME), -32768, 32767).astype(np.int32)
-
-    click_len = click.shape[0]
-    placed = 0
-    skipped = 0
-
-    for delay_ms in click_delays_ms:
-        start_sample = int(round(delay_ms * sample_rate / 1000.0))
-        if start_sample >= total_samples:
-            skipped += 1
-            continue
-        end_sample = min(total_samples, start_sample + click_len)
-        part_len = end_sample - start_sample
-        if part_len <= 0:
-            skipped += 1
-            continue
-        mixed[start_sample:end_sample] += click[:part_len]
-        placed += 1
-
-    np.clip(mixed, -32768, 32767, out=mixed)
-    write_pcm16_wav(mixed_audio_path, sample_rate, mixed.astype(np.int16))
-    size = mixed_audio_path.stat().st_size if mixed_audio_path.exists() else 0
-    log(f"✅ Готова единая WAV-дорожка голос+клики: {mixed_audio_path} | placed={placed}, skipped={skipped}, size={size} bytes")
-
-
-def mux_video_with_ready_audio_atomic(
-    visual_path: Path,
-    ready_audio_path: Path,
-    output_path: Path,
-    duration: float,
-    lang: str,
-) -> None:
-    """
-    Финальный mux без filter_complex и без amix.
-    Пишем сначала во временный mp4 в той же папке, и только после успеха заменяем финальный файл.
-    Это защищает от битого файла, если процесс оборвётся на середине.
-    """
-    temp_output = output_path.with_name(output_path.stem + "__BUILDING.mp4")
-    if temp_output.exists():
-        try:
-            temp_output.unlink()
-        except Exception:
-            pass
-
-    log(f"🎞️ Финальный mux: video={visual_path.name}, ready_audio={ready_audio_path.name}, temp={temp_output.name}")
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "info", "-stats", "-progress", "pipe:1", "-stats_period", "1",
-        "-i", str(visual_path),
-        "-i", str(ready_audio_path),
-        "-map", "0:v:0",
-        "-map", "1:a:0",
-        "-c:v", "copy",
-        "-c:a", AUDIO_CODEC,
-        "-b:a", AUDIO_BITRATE,
-        "-t", f"{duration:.3f}",
-        "-movflags", "+faststart",
-        str(temp_output),
-    ]
-    run_subprocess_verbose(cmd, f"FFmpeg final mux safe {output_path.name}")
-
-    if not temp_output.exists() or temp_output.stat().st_size <= 0:
-        raise RuntimeError(f"Финальный временный файл не создан или пустой: {temp_output}")
-
-    validate_final_mp4(temp_output, duration, lang)
-    os.replace(temp_output, output_path)
-    log(f"✅ Финальный файл атомарно заменён: {output_path}")
-
-
-def mux_audio_with_random_clicks(
-    visual_path: Path,
-    audio_path: Path,
-    output_path: Path,
-    duration: float,
-    click_sound_path: Path,
-    click_events: list[ClickEvent],
-) -> None:
-    log(f"🎧 Старт безопасной финальной склейки С кликами: video={visual_path.name}, audio={audio_path.name}, clicks={len(click_events)}, out={output_path.name}")
-    if not click_events:
-        mux_audio_plain(visual_path, audio_path, output_path, duration)
-        return
-
-    if not click_sound_path.exists():
-        raise FileNotFoundError(f"Не найден файл клика мыши: {click_sound_path}")
-
-    # Последний клик не ставим прямо в край дорожки.
-    max_click_ms = max(0, int(math.floor(duration * 1000)) - 250)
-    click_delays_ms = sorted({
-        min(max_click_ms, max(0, int(round(e.time * 1000))))
-        for e in click_events
-        if 0 <= e.time < duration
-    })
-    log(f"Кликов после фильтрации дублей/границ: {len(click_delays_ms)}")
-    if click_delays_ms:
-        log(f"Первый клик: {click_delays_ms[0]} ms, последний клик: {click_delays_ms[-1]} ms")
-        log(f"Первые 10 кликов ms: {click_delays_ms[:10]}")
-        log(f"Последние 10 кликов ms: {click_delays_ms[-10:]}")
-
-    if not click_delays_ms:
-        mux_audio_plain(visual_path, audio_path, output_path, duration)
-        return
-
-    work_dir = visual_path.parent
-    mixed_audio_wav = work_dir / f"{output_path.stem}__VOICE_PLUS_CLICKS.wav"
-    build_mixed_voice_clicks_wav(
-        audio_path=audio_path,
-        click_sound_path=click_sound_path,
-        mixed_audio_path=mixed_audio_wav,
-        click_delays_ms=click_delays_ms,
-        duration=duration,
-        work_dir=work_dir,
-        sample_rate=48000,
-        channels=2,
-    )
-    mux_video_with_ready_audio_atomic(visual_path, mixed_audio_wav, output_path, duration, lang=output_path.stem.split("_", 1)[0])
-    log(f"✅ Финальная склейка С кликами завершена безопасной схемой: {output_path}")
-
 def build(
     lang: str,
     visual_dir_override: Optional[str],
     allow_loose: bool,
     dry_run: bool,
     force: bool = False,
-    enable_clicks: bool = True,
-    click_seed: Optional[int] = None,
 ) -> bool:
     out = OUTPUT_VIDEO_DIR / f"{lang}_video_strict_sync_hold_previous.mp4"
 
@@ -1270,13 +923,6 @@ def build(
     log(f"{lang}: first image {segments[0].index:03d} -> {segments[0].path.name}")
     log(f"{lang}: last image {segments[-1].index:03d} -> {segments[-1].path.name}")
 
-    click_events: list[ClickEvent] = []
-    if enable_clicks:
-        click_events = collect_random_click_events(segments, audio_duration, seed=click_seed)
-        click_manifest = write_click_manifest(lang, click_events)
-        log(f"{lang}: mouse clicks every {CLICK_EVERY_SEGMENTS} frames: {len(click_events)}")
-        log(f"{lang}: mouse clicks manifest: {click_manifest}")
-
     if dry_run:
         log(f"{lang}: DRY RUN — видео не собиралось.")
         return True
@@ -1287,15 +933,11 @@ def build(
     with tempfile.TemporaryDirectory(prefix=f"strict_{lang}_") as td:
         log(f"Временная папка сборки: {td}")
         visual_no_audio = Path(td) / f"{lang}_visual_no_audio.mp4"
-        log(f"{lang}: этап 1/2 — создаю временную видеодорожку без аудио")
+        log(f"{lang}: этап 1/2 — создаю временную видеодорожку без аудио (с зумом)")
         render_with_fallback(segments, visual_no_audio, audio_duration)
         log(f"{lang}: этап 1/2 завершён, временный файл существует={visual_no_audio.exists()}, размер={visual_no_audio.stat().st_size if visual_no_audio.exists() else 0} bytes")
-        if enable_clicks:
-            log(f"{lang}: этап 2/2 — склеиваю видео + озвучку + клики")
-            mux_audio_with_random_clicks(visual_no_audio, audio, out, audio_duration, CLICK_SOUND_PATH, click_events)
-        else:
-            log(f"{lang}: этап 2/2 — склеиваю видео + озвучку без кликов")
-            mux_audio_plain(visual_no_audio, audio, out, audio_duration)
+        log(f"{lang}: этап 2/2 — склеиваю видео + озвучку (без кликов)")
+        mux_audio_plain(visual_no_audio, audio, out, audio_duration)
         log(f"{lang}: этап 2/2 завершён, финальный файл существует={out.exists()}, размер={out.stat().st_size if out.exists() else 0} bytes")
 
     validate_final_mp4(out, audio_duration, lang)
@@ -1314,8 +956,8 @@ def main() -> None:
     parser.add_argument("--visual-dir", default=None, help="Явная папка с картинками. Используй только когда собираешь один язык.")
     parser.add_argument("--allow-loose-image-match", action="store_true", help="Разрешить мягкий подбор картинки по номеру, если строгий не нашёл.")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--no-clicks", action="store_true", help="Собрать без рандомных кликов мыши.")
-    parser.add_argument("--click-seed", type=int, default=None, help="Seed для повторяемой рандомной расстановки кликов.")
+    parser.add_argument("--no-zoom", action="store_true", help="Собрать без зума (статичные кадры).")
+    parser.add_argument("--zoom-max", type=float, default=None, help="Сила зума, например 1.08 или 1.15. По умолчанию из настроек скрипта.")
     parser.add_argument(
         "--force",
         action="store_true",
@@ -1328,8 +970,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    global ZOOM_ENABLED, ZOOM_MAX
+    if args.no_zoom:
+        ZOOM_ENABLED = False
+    if args.zoom_max is not None:
+        ZOOM_MAX = max(1.0, args.zoom_max)
+
     check_dependencies()
-    log("🚀 ONE-CLICK SAFE режим: старые mp4 не используются, сборка идёт заново, клики включены")
+    log(f"🚀 ONE-CLICK SAFE режим: старые mp4 не используются, сборка идёт заново, БЕЗ кликов, зум={'ON' if ZOOM_ENABLED else 'OFF'} (max={ZOOM_MAX})")
 
     if args.lang == "ALL" and args.visual_dir:
         log("⚠️ --visual-dir передан вместе с --lang ALL. Одна папка не может подходить сразу RU и EN.")
@@ -1350,8 +998,6 @@ def main() -> None:
             allow_loose=args.allow_loose_image_match,
             dry_run=args.dry_run,
             force=(not args.skip_existing),
-            enable_clicks=not args.no_clicks,
-            click_seed=args.click_seed,
         )
         if ok:
             ok_count += 1
