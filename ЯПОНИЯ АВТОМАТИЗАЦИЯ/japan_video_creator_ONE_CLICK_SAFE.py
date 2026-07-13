@@ -41,7 +41,8 @@ ONE-CLICK SAFE semantic montage for ЯПОНИЯ АВТОМАТИЗАЦИЯ.
 5) Видеоряд:
    - только картинки;
    - БЕЗ кликов мыши (полностью убраны);
-   - с плавным зумом (эффект Кена Бёрнса) на каждом кадре;
+   - с плавным зумом без дрожания (Кен Бёрнс, субпиксельный warpAffine + ease-in-out);
+   - берётся каждая N-я картинка (IMAGE_EVERY_N, по умолчанию каждая 3-я), чтобы не было переспама;
    - без переходов;
    - по абсолютным таймкодам;
    - паузы между фразами закрываются предыдущей картинкой.
@@ -123,11 +124,15 @@ PIXEL_FORMAT = "yuv420p"
 AUDIO_CODEC = "aac"
 AUDIO_BITRATE = "192k"
 
-# ЗУМ (эффект Кена Бёрнса): плавное приближение/отдаление на каждом кадре.
-# Клики полностью убраны, вместо них — живой медленный зум.
+# ЗУМ (эффект Кена Бёрнса): плавное приближение/отдаление.
+# Субпиксельный, через warpAffine — не трясётся.
 ZOOM_ENABLED = True
-ZOOM_MAX = 1.12                 # максимальное приближение к краю кадра (1.12 = +12%)
-ZOOM_ALTERNATE_DIRECTION = True  # чередовать: один кадр приближение, следующий отдаление
+ZOOM_MAX = 1.08                 # мягкое приближение (1.08 = +8%); больше = сильнее движение
+ZOOM_ALTERNATE_DIRECTION = True  # чередовать: одна картинка приближается, следующая отдаляется
+
+# Сколько картинок брать: 1 = все, 3 = каждая третья (реже смена кадра, без переспама).
+# Выбранная картинка растягивается на время своих N блоков — тайминг и синхрон с озвучкой сохраняются.
+IMAGE_EVERY_N = 3
 
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -621,12 +626,34 @@ def collect_segments(lang: str, visual_dir: Path, timing_file: Path, prompts_fil
     images = list_images(visual_dir)
     texts = read_voice_texts_from_prompts(prompts_file)
 
+    # Берём каждую N-ю картинку (IMAGE_EVERY_N), чтобы не было переспама кадров.
+    # Выбранная запись растягивается по времени до начала следующей выбранной,
+    # поэтому тайминг и синхрон с озвучкой полностью сохраняются.
+    step = max(1, IMAGE_EVERY_N)
+    kept = entries[::step]
+    if not kept:
+        kept = entries
+
+    spans: list[tuple[TimingEntry, float, float]] = []
+    for i, e in enumerate(kept):
+        span_start = e.start
+        if i + 1 < len(kept):
+            span_end = kept[i + 1].start
+        else:
+            span_end = max(e.end, entries[-1].end, audio_duration)
+        if span_end <= span_start:
+            span_end = span_start + max(0.04, e.end - e.start)
+        spans.append((e, span_start, span_end))
+
+    log(f"{lang}: всего блоков={len(entries)}, берём каждую {step}-ю картинку -> кадров в монтаже={len(spans)}")
+
     segments: list[Segment] = []
     previous_path: Optional[Path] = None
     previous_index: Optional[int] = None
     missing_count = 0
+    kept_entries = [s[0] for s in spans]
 
-    for pos, e in enumerate(entries):
+    for pos, (e, span_start, span_end) in enumerate(spans):
         try:
             path, how = resolve_image_for_entry(e, visual_dir, images, allow_loose=allow_loose)
             previous_path = path
@@ -639,7 +666,7 @@ def collect_segments(lang: str, visual_dir: Path, timing_file: Path, prompts_fil
                 how = f"missing_image_hold_previous:index_{previous_index:03d}; original_error={exc}"
                 log(f"⚠️ {lang}: нет картинки для блока {e.index:03d}; держу предыдущую {previous_path.name}")
             else:
-                next_found = find_next_available_image(entries, pos, visual_dir, images, allow_loose=allow_loose)
+                next_found = find_next_available_image(kept_entries, pos, visual_dir, images, allow_loose=allow_loose)
                 if next_found:
                     path, next_how, next_index = next_found
                     how = f"missing_first_image_use_next:index_{next_index:03d}; {next_how}; original_error={exc}"
@@ -655,8 +682,8 @@ def collect_segments(lang: str, visual_dir: Path, timing_file: Path, prompts_fil
         segments.append(
             Segment(
                 index=e.index,
-                start=e.start,
-                end=e.end,
+                start=span_start,
+                end=span_end,
                 path=path,
                 voice_text=texts.get(e.index, ""),
                 image_name_from_times=e.image_name,
@@ -722,9 +749,20 @@ def resize_cover(frame, target_w: int, target_h: int):
     return resized[y1:y1 + target_h, x1:x1 + target_w]
 
 
+def _smoothstep(t: float) -> float:
+    """Плавное ускорение/замедление (ease-in-out), чтобы не было рывка в начале и конце."""
+    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+    return t * t * (3.0 - 2.0 * t)
+
+
 def zoom_frame(base, t: float, zoom_in: bool):
     """
-    Возвращает кадр с эффектом плавного зума (Кен Бёрнс).
+    Возвращает кадр с ПЛАВНЫМ зумом (Кен Бёрнс) без дрожания.
+
+    Масштабирование делается субпиксельно через cv2.warpAffine вокруг центра
+    кадра — поэтому картинка не «трясётся» покадрово, как это было при
+    целочисленном кропе.
+
     base — уже приведённая к размеру TARGET картинка (cover).
     t — прогресс внутри кадра, 0.0 → 1.0.
     zoom_in=True:  плавно приближаем (1.0 → ZOOM_MAX).
@@ -732,20 +770,24 @@ def zoom_frame(base, t: float, zoom_in: bool):
     """
     if not ZOOM_ENABLED or ZOOM_MAX <= 1.0:
         return base
-    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+
+    te = _smoothstep(t)
     span = ZOOM_MAX - 1.0
-    z = (1.0 + span * t) if zoom_in else (ZOOM_MAX - span * t)
+    z = (1.0 + span * te) if zoom_in else (ZOOM_MAX - span * te)
 
     h, w = base.shape[:2]
-    # Размер центрального кропа, который потом растягиваем обратно до полного кадра.
-    cw = max(1, int(round(w / z)))
-    ch = max(1, int(round(h / z)))
-    x1 = (w - cw) // 2
-    y1 = (h - ch) // 2
-    crop = base[y1:y1 + ch, x1:x1 + cw]
-    if cw == w and ch == h:
-        return base
-    return cv2.resize(crop, (w, h), interpolation=cv2.INTER_LINEAR)
+    cx, cy = (w - 1) / 2.0, (h - 1) / 2.0
+    # Аффинная матрица: масштаб z вокруг центра (субпиксельно, без рывков).
+    M = np.array(
+        [[z, 0.0, cx - z * cx],
+         [0.0, z, cy - z * cy]],
+        dtype=np.float32,
+    )
+    return cv2.warpAffine(
+        base, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
 
 
 def write_frame(proc, frame, count: int) -> int:
@@ -957,7 +999,8 @@ def main() -> None:
     parser.add_argument("--allow-loose-image-match", action="store_true", help="Разрешить мягкий подбор картинки по номеру, если строгий не нашёл.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-zoom", action="store_true", help="Собрать без зума (статичные кадры).")
-    parser.add_argument("--zoom-max", type=float, default=None, help="Сила зума, например 1.08 или 1.15. По умолчанию из настроек скрипта.")
+    parser.add_argument("--zoom-max", type=float, default=None, help="Сила зума, например 1.06 или 1.12. По умолчанию из настроек скрипта.")
+    parser.add_argument("--every-n-images", type=int, default=None, help="Брать каждую N-ю картинку. 1 = все, 3 = каждая третья. По умолчанию из настроек скрипта.")
     parser.add_argument(
         "--force",
         action="store_true",
@@ -970,14 +1013,16 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    global ZOOM_ENABLED, ZOOM_MAX
+    global ZOOM_ENABLED, ZOOM_MAX, IMAGE_EVERY_N
     if args.no_zoom:
         ZOOM_ENABLED = False
     if args.zoom_max is not None:
         ZOOM_MAX = max(1.0, args.zoom_max)
+    if args.every_n_images is not None:
+        IMAGE_EVERY_N = max(1, args.every_n_images)
 
     check_dependencies()
-    log(f"🚀 ONE-CLICK SAFE режим: старые mp4 не используются, сборка идёт заново, БЕЗ кликов, зум={'ON' if ZOOM_ENABLED else 'OFF'} (max={ZOOM_MAX})")
+    log(f"🚀 ONE-CLICK SAFE режим: без кликов, зум={'ON' if ZOOM_ENABLED else 'OFF'} (max={ZOOM_MAX}, плавный/warpAffine), каждая {IMAGE_EVERY_N}-я картинка")
 
     if args.lang == "ALL" and args.visual_dir:
         log("⚠️ --visual-dir передан вместе с --lang ALL. Одна папка не может подходить сразу RU и EN.")
