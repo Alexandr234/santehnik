@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-ДОБИВКА видео до 100% для связки скриптов с ПЕРСОНАЖАМИ.
+ДОБИВКА картинок И видео до 100% для связки скриптов с ПЕРСОНАЖАМИ.
 
 Связка (проект /Users/aleksandrtomilov/Desktop/ПРОМПТЫ):
   1) master_prompt_pipeline_...            -> generated_prompts.txt / generated_image_prompts.txt
@@ -9,31 +9,31 @@
        и КАРТИНКИ/0001.png ... (сцены, сгенерированные с учётом референсов персонажей).
   3) video_from_local_images_base64.py     -> ВИДЕО/0001.mp4 (оживление картинок сцены).
 
-Этот скрипт добивает видео, которые НЕ сгенерировались в шаге 3.
+Этот скрипт добивает то, что НЕ сгенерировалось на шагах 2 и 3.
 
-Провайдер видео: flower (модель flower-video / Veo 3.1), operation flower_video_from_image.
+Провайдер: flower (картинки — flower-image, видео — flower-video / Veo 3.1).
+  • Картинки: operation flower_image_generate.
+  • Видео:    operation flower_video_from_image.
 
-Важно про персонажей:
-  • В видео-шаге референс-картинка персонажа НЕ передаётся — персонаж уже "вшит" в картинку
-    сцены. Связь с персонажем живёт в ТЕКСТЕ промпта ([Alias] + имя, напр. "King Solomon...").
-    Именно имена (особенно именованные исторические/религиозные фигуры) чаще всего валят
-    video-фильтр.
-  • Требование: сначала пробуем сгенерировать видео С ПЕРСОНАЖЕМ. Если по какой-то причине
-    3 раза подряд не вышло — ОТВЯЗЫВАЕМ сцену от персонажа (убираем имя/маркер, анонимизируем)
-    и продолжаем. Дальше — эскалация до гарантированного "оживить только движением".
+Что делает (две фазы):
 
-Ступени для каждой пропущенной сцены:
-  A. Если у сцены есть персонаж(и):
-       попытка 1: промпт с персонажем как есть;
-       попытка 2: с персонажем, но без сцен насилия (санитайз, имена сохранены);
-       попытка 3: с персонажем, усиленный санитайз (имена сохранены);
-       -> если все 3 не вышли, ОТВЯЗКА персонажа.
-  B. Отвязанные / нейтральные ступени (и вход для сцен без персонажа):
-       - анонимизированная сцена (имена персонажей заменены на "an anonymous person");
-       - + санитайз насилия;
-       - motion-preserve (только движение, кадр без изменений);
-       - motion-minimal (гарантированно проходит фильтр).
-  + Доп. заходы motion-minimal на случай сетевых сбоев -> итог 100%.
+  ФАЗА 1 — ДОБИВКА КАРТИНОК.
+    Для каждой сцены, у которой есть промпт, но НЕТ картинки в КАРТИНКИ/ (частая причина —
+    картинку срезал контент-фильтр), генерирует картинку через flower_image_generate с той же
+    логикой эскалации, что и видео:
+       A. с персонажем: как есть -> санитайз насилия (имена сохранены) -> усиленный санитайз;
+       B. отвязка: анонимизация имён -> анонимизация + санитайз -> гарантированный безопасный fallback.
+
+  ФАЗА 2 — ДОБИВКА ВИДЕО.
+    Для каждой картинки, у которой нет видео, оживляет её (image->video) с логикой персонажей:
+       A. с персонажем (до CHARACTER_ATTEMPTS раз);
+       B. отвязка / нейтрально: анонимизация -> санитайз -> motion-preserve -> motion-minimal;
+       + доп. заходы motion-minimal (страховка от сети/перегрузки).
+
+    ГЛУБОКИЙ FALLBACK: если видео так и не выходит (обычно проблема в самой картинке —
+    в ней "вшит" персонаж/сюжет, который валит video-фильтр), скрипт ПЕРЕДЕЛЫВАЕТ САМУ
+    КАРТИНКУ новым безопасным/анонимизированным промптом (flower_image_generate), а затем
+    оживляет уже новую картинку. Старая картинка бэкапится в КАРТИНКИ/_regen_backup/.
 
 Безопасность:
   • FAST_GEN_API_KEY — ключ media_gen (из окружения, не хардкодим).
@@ -42,8 +42,11 @@
 Запуск:
    export FAST_GEN_API_KEY="ТВОЙ_КЛЮЧ"
    export OPENAI_API_KEY="sk-..."          # опционально
-   python video_repair_characters_100percent.py
+   python video_repair_characters_100percent.py                 # картинки + видео
    python video_repair_characters_100percent.py --dry-run
+   python video_repair_characters_100percent.py --images-only    # только добивка картинок
+   python video_repair_characters_100percent.py --videos-only    # только добивка видео
+   python video_repair_characters_100percent.py --no-image-regen # без переделки картинок в fallback
    python video_repair_characters_100percent.py --limit 20
 """
 
@@ -55,6 +58,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import threading
 import time
 from collections import deque
@@ -82,17 +86,24 @@ BASE_DIR = Path(os.getenv("BASE_FOLDER", "/Users/aleksandrtomilov/Desktop/ПРО
 IMAGES_DIR = BASE_DIR / "КАРТИНКИ"
 VIDEOS_DIR = BASE_DIR / "ВИДЕО"
 
-# Файлы промптов (те же, что читает video_from_local_images_base64.py) — со строками [Alias].
+# Файлы промптов ВИДЕО (те же, что читает video_from_local_images_base64.py) — со строками [Alias].
 PROMPTS_FILE_PRIMARY = BASE_DIR / "generated_prompts_detailed.txt"
 PROMPTS_FILE_FALLBACK = BASE_DIR / "generated_prompts.txt"
+
+# Файлы промптов КАРТИНОК (если есть — используются для добивки/переделки картинок).
+# Если их нет — как промпт картинки берётся тело видео-промпта сцены.
+IMAGE_PROMPTS_FILE_PRIMARY = BASE_DIR / "generated_image_prompts_detailed.txt"
+IMAGE_PROMPTS_FILE_FALLBACK = BASE_DIR / "generated_image_prompts.txt"
 
 # State персонажей из шага 2 (alias -> {path, file_hash, ...}) — используем только чтобы
 # лучше знать список имён персонажей для анонимизации.
 CHARACTER_STATE_FILE = BASE_DIR / "character_generation_state.json"
 
 LOG_FILE = BASE_DIR / "video_repair_characters_log.json"
+IMAGE_LOG_FILE = BASE_DIR / "image_repair_characters_log.json"
 DETACHED_FILE = BASE_DIR / "video_repair_detached_characters.json"
 RATE_LIMIT_FILE = BASE_DIR / "video_rate_limit_state.json"
+IMAGE_RATE_LIMIT_FILE = BASE_DIR / "image_rate_limit_state.json"
 
 REQUEST_TIMEOUT = int(os.getenv("FAST_GEN_REQUEST_TIMEOUT", "300"))
 POLL_INTERVAL = int(os.getenv("FAST_GEN_OPERATION_POLL_SEC", "20"))
@@ -100,9 +111,9 @@ POLL_TIMEOUT = int(os.getenv("FAST_GEN_POLL_TIMEOUT", str(60 * 60 * 4)))
 RETRY_DELAY_SEC = int(os.getenv("FAST_GEN_RETRY_DELAY_SEC", "8"))
 MAX_HTTP_ATTEMPTS = max(1, int(os.getenv("FAST_GEN_MAX_ATTEMPTS", "4")))
 
-# Сколько раз пробуем сгенерировать видео С ПЕРСОНАЖЕМ перед отвязкой.
+# Сколько раз пробуем сгенерировать С ПЕРСОНАЖЕМ перед отвязкой (и для картинок, и для видео).
 CHARACTER_ATTEMPTS = max(1, int(os.getenv("FAST_GEN_CHARACTER_ATTEMPTS", "3")))
-# Доп. заходы на гарантированном motion-minimal (страховка от сети/перегрузки провайдера).
+# Доп. заходы на гарантированном minimal/safe (страховка от сети/перегрузки провайдера).
 EXTRA_GUARANTEED_ROUNDS = int(os.getenv("FAST_GEN_EXTRA_GUARANTEED_ROUNDS", "6"))
 
 # Провайдер часто отвечает "Generation failed, please try again later" — это ВРЕМЕННАЯ
@@ -112,14 +123,17 @@ TRANSIENT_RETRIES = max(1, int(os.getenv("FAST_GEN_TRANSIENT_RETRIES", "5")))
 BACKOFF_CAP_SEC = int(os.getenv("FAST_GEN_BACKOFF_CAP_SEC", "90"))
 
 MAX_VIDEO_WORKERS = int(os.getenv("FAST_GEN_VIDEO_WORKERS", "6"))
+MAX_IMAGE_WORKERS = int(os.getenv("FAST_GEN_IMAGE_WORKERS", "6"))
 
 ASPECT_RATIO = os.getenv("FAST_GEN_VIDEO_ASPECT_RATIO", "16:9")
 # Canonical V6 operation id для image->video на flower (Veo 3.1).
-# См. GET /api/v6/capabilities — flower_video_from_image, provider=flower,
-# model=flower-video, 1 кредит.
 VIDEO_OPERATION = os.getenv("FAST_GEN_VIDEO_OPERATION", "flower_video_from_image")
-# Необязательный shorthand-model. По умолчанию flower-video (Veo 3.1).
 VIDEO_MODEL = os.getenv("FAST_GEN_VIDEO_MODEL") or None
+
+# Canonical V6 operation id для генерации картинок на flower (flower-image).
+IMAGE_ASPECT_RATIO = os.getenv("FAST_GEN_IMAGE_ASPECT_RATIO", ASPECT_RATIO)
+IMAGE_OPERATION = os.getenv("FAST_GEN_IMAGE_OPERATION", "flower_image_generate")
+IMAGE_MODEL = os.getenv("FAST_GEN_IMAGE_MODEL") or None
 
 _SEED_ENV = os.getenv("FAST_GEN_SEED", "").strip()
 GENERATION_SEED: Optional[int] = int(_SEED_ENV) if _SEED_ENV.lstrip("-").isdigit() else None
@@ -128,10 +142,24 @@ VIDEO_DURATION_SECONDS: Optional[int] = int(_DURATION_ENV) if _DURATION_ENV.isdi
 VIDEO_RESOLUTION = os.getenv("FAST_GEN_VIDEO_RESOLUTION") or None
 # ВНИМАНИЕ: ultra и keyframes — только flow-video, для flower не используются.
 
+# ГЛУБОКИЙ FALLBACK: переделывать саму картинку, если видео упорно не выходит.
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+REGEN_IMAGE_WHEN_STUCK = _env_bool("FAST_GEN_REGEN_IMAGE_WHEN_STUCK", True)
+IMAGE_REGEN_ROUNDS = int(os.getenv("FAST_GEN_IMAGE_REGEN_ROUNDS", "3"))
+REGEN_IMAGE_BACKUP = _env_bool("FAST_GEN_REGEN_IMAGE_BACKUP", True)
+
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MIN_VIDEO_BYTES = int(os.getenv("FAST_GEN_MIN_VIDEO_BYTES", "1024"))
+MIN_IMAGE_BYTES = int(os.getenv("FAST_GEN_MIN_IMAGE_BYTES", "1024"))
 
 MAX_VIDEO_STARTS_PER_HOUR = int(os.getenv("FAST_GEN_MAX_VIDEO_STARTS_PER_HOUR", "150"))
+MAX_IMAGE_STARTS_PER_HOUR = int(os.getenv("FAST_GEN_MAX_IMAGE_STARTS_PER_HOUR", "150"))
 RATE_WINDOW_SECONDS = 3600
 
 PROMPT_MODEL = os.getenv("PROMPT_MODEL", "gpt-4o-mini")
@@ -146,6 +174,11 @@ DEFAULT_ANIMATION_PROMPT = (
     "natural details, preserve the original composition, subject, lighting and style."
 )
 
+DEFAULT_IMAGE_PROMPT = (
+    "A calm, respectful documentary illustration. Neutral peaceful scene, soft natural lighting, "
+    "balanced composition. No text, no logos, no watermark."
+)
+
 MOTION_PRESERVE_PROMPT = (
     "Animate the existing scene in this image with subtle, natural, realistic motion. "
     "Preserve exactly the same subject, composition, colors, lighting and style. "
@@ -155,6 +188,14 @@ MOTION_PRESERVE_PROMPT = (
 MOTION_MINIMAL_PROMPT = (
     "Gently animate this image with very subtle motion and a slow calm camera push-in, "
     "keeping everything exactly as it is. No new elements. No text, no watermark."
+)
+
+# Гарантированно безопасный промпт картинки — последняя ступень, всегда должна проходить фильтр.
+SAFE_IMAGE_FALLBACK = (
+    "A calm, respectful, fully clothed historical documentary illustration. "
+    "Neutral peaceful scene with soft natural lighting and a balanced composition. "
+    "No violence, no gore, no weapons, no nudity, no distressing content, "
+    "no text, no logos, no watermark."
 )
 
 PERMANENT_ERROR_MARKERS = (
@@ -215,6 +256,7 @@ HONORIFICS = (
 
 print_lock = threading.Lock()
 results_lock = threading.Lock()
+image_results_lock = threading.Lock()
 rate_limit_lock = threading.Lock()
 
 
@@ -289,7 +331,8 @@ def path_sort_key(path: Path):
 class Scene:
     index: int          # порядковый индекс сцены (= номер строки промпта = stem картинки)
     aliases: List[str] = field(default_factory=list)
-    body: str = ""      # текст сцены без [Alias]-скобок (имена внутри текста сохранены)
+    body: str = ""      # текст сцены (видео/анимация) без [Alias]-скобок
+    image_body: str = ""  # текст промпта КАРТИНКИ (если есть отдельный файл), иначе ""
 
 
 def parse_prompt_line(line: str) -> Tuple[List[str], str]:
@@ -301,19 +344,10 @@ def parse_prompt_line(line: str) -> Tuple[List[str], str]:
     return [], line.strip()
 
 
-def load_scenes_map() -> Dict[int, Scene]:
-    """Индекс сцены -> Scene. Индексация как в video_from_local_images_base64.py:
-    пропускаем пустые и ### строки, порядковый счётчик 1,2,3..."""
-    prompts_file = None
-    if PROMPTS_FILE_PRIMARY.exists():
-        prompts_file = PROMPTS_FILE_PRIMARY
-    elif PROMPTS_FILE_FALLBACK.exists():
-        prompts_file = PROMPTS_FILE_FALLBACK
-    if not prompts_file:
-        log("[INFO] Файл промптов не найден — сцены без персонажей, DEFAULT-анимация.")
-        return {}
-
-    scenes: Dict[int, Scene] = {}
+def _read_prompt_blocks(prompts_file: Path) -> Dict[int, Tuple[List[str], str]]:
+    """Читает файл промптов по той же логике, что video_from_local_images_base64.py:
+    пропускаем пустые и ### строки, порядковый счётчик 1,2,3... -> {idx: (aliases, body)}."""
+    result: Dict[int, Tuple[List[str], str]] = {}
     idx = 0
     for raw in prompts_file.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
@@ -321,9 +355,46 @@ def load_scenes_map() -> Dict[int, Scene]:
             continue
         idx += 1
         aliases, body = parse_prompt_line(line)
-        scenes[idx] = Scene(index=idx, aliases=aliases, body=body)
-    log(f"[INFO] Файл промптов: {prompts_file.name} ({len(scenes)} сцен, "
-        f"с персонажами: {sum(1 for s in scenes.values() if s.aliases)})")
+        result[idx] = (aliases, body)
+    return result
+
+
+def _find_prompts_file(primary: Path, fallback: Path) -> Optional[Path]:
+    if primary.exists():
+        return primary
+    if fallback.exists():
+        return fallback
+    return None
+
+
+def load_scenes() -> Dict[int, Scene]:
+    """Собирает единую карту сцен: видео-промпт (body) + промпт картинки (image_body)."""
+    scenes: Dict[int, Scene] = {}
+
+    video_file = _find_prompts_file(PROMPTS_FILE_PRIMARY, PROMPTS_FILE_FALLBACK)
+    if video_file:
+        for idx, (aliases, body) in _read_prompt_blocks(video_file).items():
+            scenes[idx] = Scene(index=idx, aliases=list(aliases), body=body)
+        log(f"[INFO] Видео-промпты: {video_file.name} ({len(scenes)} сцен, "
+            f"с персонажами: {sum(1 for s in scenes.values() if s.aliases)})")
+    else:
+        log("[INFO] Файл видео-промптов не найден — сцены без персонажей, DEFAULT-анимация.")
+
+    image_file = _find_prompts_file(IMAGE_PROMPTS_FILE_PRIMARY, IMAGE_PROMPTS_FILE_FALLBACK)
+    if image_file:
+        img_blocks = _read_prompt_blocks(image_file)
+        for idx, (aliases, body) in img_blocks.items():
+            if idx in scenes:
+                scenes[idx].image_body = body
+                for a in aliases:
+                    if a not in scenes[idx].aliases:
+                        scenes[idx].aliases.append(a)
+            else:
+                scenes[idx] = Scene(index=idx, aliases=list(aliases), body="", image_body=body)
+        log(f"[INFO] Промпты картинок: {image_file.name} ({len(img_blocks)} шт.)")
+    else:
+        log("[INFO] Отдельного файла промптов картинок нет — для картинок беру тело видео-промпта.")
+
     return scenes
 
 
@@ -341,13 +412,30 @@ def load_known_names() -> set:
 def list_images() -> List[Path]:
     if not IMAGES_DIR.exists():
         return []
-    images = [p for p in IMAGES_DIR.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+    images = [p for p in IMAGES_DIR.iterdir()
+              if p.is_file() and p.suffix.lower() in IMAGE_EXTS and not p.name.startswith("_")]
     images.sort(key=path_sort_key)
     return images
 
 
 def scene_index_for(image_path: Path, order: int) -> int:
     return int(image_path.stem) if image_path.stem.isdigit() else order
+
+
+def existing_image_indices() -> set:
+    """Множество индексов сцен, для которых уже есть картинка нормального размера."""
+    result = set()
+    for order, p in enumerate(list_images(), start=1):
+        try:
+            if p.stat().st_size >= MIN_IMAGE_BYTES:
+                result.add(scene_index_for(p, order))
+        except OSError:
+            continue
+    return result
+
+
+def image_path_for_index(idx: int) -> Path:
+    return IMAGES_DIR / f"{idx:04d}.png"
 
 
 # =========================================================
@@ -429,7 +517,7 @@ def _llm(messages) -> Optional[str]:
 def rewrite_keep_character(body: str) -> str:
     """Санитайз насилия, но персонаж и его имя сохранены."""
     out = _llm([
-        {"role": "system", "content": "You edit video-animation prompts to pass strict content filters "
+        {"role": "system", "content": "You edit visual generation prompts to pass strict content filters "
                                        "while staying visual and documentary-realistic."},
         {"role": "user", "content": "Rewrite this prompt so it safely passes strict content moderation. "
                                      "Remove any violence, gore, blood, killing, weapons in use, torture or "
@@ -456,8 +544,19 @@ def rewrite_anonymize(body: str, aliases: List[str], known_names: set) -> str:
     return out or heuristic_sanitize(anonymize(body, aliases, known_names), 2)
 
 
+def scene_image_base_prompt(scene: Optional[Scene]) -> str:
+    """Базовый промпт для генерации КАРТИНКИ сцены (отдельный image-промпт или тело видео-промпта)."""
+    if scene is None:
+        return DEFAULT_IMAGE_PROMPT
+    if scene.image_body:
+        return scene.image_body
+    if scene.body:
+        return remove_brackets(scene.body)
+    return DEFAULT_IMAGE_PROMPT
+
+
 # =========================================================
-# IMAGE -> DATA URI / VIDEO SAVE
+# IMAGE -> DATA URI / SAVE (image & video)
 # =========================================================
 
 def image_to_data_uri(image_path: Path) -> str:
@@ -488,45 +587,54 @@ def recursive_find_strings(obj: Any) -> List[str]:
     return found
 
 
-def extract_video_source(data: Dict[str, Any]) -> str:
+def extract_media_source(data: Dict[str, Any], media_prefix: str) -> str:
+    """Достаёт источник результата: inline data URI нужного типа либо download_url."""
     results = data.get("results")
     if isinstance(results, list):
         for item in results:
             if not isinstance(item, dict):
                 continue
             inline = item.get("data")
-            if isinstance(inline, str) and inline.startswith("data:video/"):
+            if isinstance(inline, str) and inline.startswith(media_prefix):
                 return inline
             url = item.get("download_url")
             if isinstance(url, str) and url:
                 return url
     for s in recursive_find_strings(data):
-        if s.startswith("data:video/"):
+        if s.startswith(media_prefix):
             return s
     for s in recursive_find_strings(data):
         if re.match(r"^https?://.+", s, flags=re.IGNORECASE):
             return s
-    raise TransientError(f"Не найден video source: {json.dumps(data, ensure_ascii=False)[:1200]}")
+    raise TransientError(f"Не найден media source: {json.dumps(data, ensure_ascii=False)[:1200]}")
 
 
-def save_video_from_source(source: str, out_path: Path) -> None:
+def save_bytes_from_source(source: str, out_path: Path, min_bytes: int, inline_prefix: str) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if source.startswith("data:video/"):
+    if source.startswith(inline_prefix) or source.startswith("data:"):
         _, b64 = source.split(",", 1)
         out_path.write_bytes(base64.b64decode(b64))
     elif source.startswith(("http://", "https://")):
         with requests.get(source, stream=True, headers={"X-API-Key": API_KEY}, timeout=REQUEST_TIMEOUT) as r:
             if 400 <= r.status_code < 500:
-                raise PermanentError(f"HTTP {r.status_code} при скачивании видео")
+                raise PermanentError(f"HTTP {r.status_code} при скачивании результата")
             r.raise_for_status()
             with out_path.open("wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
     else:
-        raise TransientError(f"Неподдерживаемый video source: {source[:200]}")
-    if not out_path.exists() or out_path.stat().st_size < MIN_VIDEO_BYTES:
-        raise TransientError(f"Видео не сохранилось/слишком маленькое: {out_path}")
+        raise TransientError(f"Неподдерживаемый media source: {source[:200]}")
+    if not out_path.exists() or out_path.stat().st_size < min_bytes:
+        raise TransientError(f"Результат не сохранился/слишком маленький: {out_path}")
+
+
+def save_video_from_source(source: str, out_path: Path) -> None:
+    save_bytes_from_source(source, out_path, MIN_VIDEO_BYTES, "data:video/")
+
+
+def save_image_from_source(source: str, out_path: Path) -> None:
+    save_bytes_from_source(source, out_path, MIN_IMAGE_BYTES, "data:image/")
 
 
 # =========================================================
@@ -593,7 +701,7 @@ def extract_generation_id(data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def build_payload(prompt: str, image_data_uri: str) -> Dict[str, Any]:
+def build_video_payload(prompt: str, image_data_uri: str) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "operation": VIDEO_OPERATION,
         "prompt": prompt,
@@ -609,6 +717,19 @@ def build_payload(prompt: str, image_data_uri: str) -> Dict[str, Any]:
     if VIDEO_RESOLUTION:
         payload["resolution"] = VIDEO_RESOLUTION
     # ВНИМАНИЕ: ultra и keyframes — только flow-video, для flower не отправляем.
+    return payload
+
+
+def build_image_payload(prompt: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "operation": IMAGE_OPERATION,
+        "prompt": prompt,
+        "aspect_ratio": IMAGE_ASPECT_RATIO,
+    }
+    if IMAGE_MODEL:
+        payload["model"] = IMAGE_MODEL
+    if GENERATION_SEED is not None:
+        payload["seed"] = GENERATION_SEED
     return payload
 
 
@@ -633,33 +754,45 @@ def poll_generation(generation_id: str, tag: str) -> Dict[str, Any]:
         time.sleep(POLL_INTERVAL)
 
 
-def generate_once(prompt: str, image_data_uri: str, out_path: Path) -> str:
-    """Одна попытка: старт + ожидание + сохранение. Кидает Permanent/Transient."""
+# ---- одна попытка + устойчивость к временным ошибкам (общая для картинок и видео) ----
+
+def generate_video_once(prompt: str, image_data_uri: str, out_path: Path) -> str:
     video_rate_limiter.acquire(out_path.name)
     url = normalize_base_url(BASE_URL) + V6_GENERATIONS_ENDPOINT
-    data = request_post(url, build_payload(prompt, image_data_uri))
+    data = request_post(url, build_video_payload(prompt, image_data_uri))
     generation_id = extract_generation_id(data)
     if not generation_id:
-        raise PermanentError(f"API не вернул generation id: {data}")
+        raise PermanentError(f"API не вернул generation id (video): {data}")
     result = poll_generation(generation_id, out_path.name)
-    save_video_from_source(extract_video_source(result), out_path)
+    save_video_from_source(extract_media_source(result, "data:video/"), out_path)
     return generation_id
 
 
-def generate_attempt(prompt: str, image_data_uri: str, out_path: Path,
-                     retries: Optional[int] = None) -> str:
+def generate_image_once(prompt: str, out_path: Path) -> str:
+    image_rate_limiter.acquire(out_path.name)
+    url = normalize_base_url(BASE_URL) + V6_GENERATIONS_ENDPOINT
+    data = request_post(url, build_image_payload(prompt))
+    generation_id = extract_generation_id(data)
+    if not generation_id:
+        raise PermanentError(f"API не вернул generation id (image): {data}")
+    result = poll_generation(generation_id, out_path.name)
+    save_image_from_source(extract_media_source(result, "data:image/"), out_path)
+    return generation_id
+
+
+def _attempt(once_fn, out_path: Path, retries: Optional[int]) -> str:
     """Одна "попытка" уровня, устойчивая к ВРЕМЕННЫМ ошибкам провайдера.
 
-    "Generation failed, please try again later" и сетевые сбои повторяются на ТОМ ЖЕ
-    промпте с нарастающей паузой (до `retries` под-повторов). PermanentError (safety-блок)
-    пробрасывается сразу — это сигнал эскалировать/отвязать персонажа.
+    Временные ошибки ("try again later", сеть) повторяются на ТОМ ЖЕ промпте с нарастающей
+    паузой (до `retries` под-повторов). PermanentError (safety-блок) пробрасывается сразу —
+    это сигнал эскалировать/отвязать персонажа.
     """
     retries = retries or TRANSIENT_RETRIES
     delay = float(RETRY_DELAY_SEC)
     last_error: Optional[Exception] = None
     for i in range(1, retries + 1):
         try:
-            return generate_once(prompt, image_data_uri, out_path)
+            return once_fn()
         except PermanentError:
             raise
         except KeyboardInterrupt:
@@ -671,6 +804,15 @@ def generate_attempt(prompt: str, image_data_uri: str, out_path: Path,
                 time.sleep(delay)
                 delay = min(delay * 1.7, BACKOFF_CAP_SEC)
     raise TransientError(str(last_error))
+
+
+def generate_video_attempt(prompt: str, image_data_uri: str, out_path: Path,
+                           retries: Optional[int] = None) -> str:
+    return _attempt(lambda: generate_video_once(prompt, image_data_uri, out_path), out_path, retries)
+
+
+def generate_image_attempt(prompt: str, out_path: Path, retries: Optional[int] = None) -> str:
+    return _attempt(lambda: generate_image_once(prompt, out_path), out_path, retries)
 
 
 # =========================================================
@@ -716,19 +858,130 @@ class HourlyRateLimiter:
 
 
 video_rate_limiter = HourlyRateLimiter(RATE_LIMIT_FILE, MAX_VIDEO_STARTS_PER_HOUR, RATE_WINDOW_SECONDS)
+image_rate_limiter = HourlyRateLimiter(IMAGE_RATE_LIMIT_FILE, MAX_IMAGE_STARTS_PER_HOUR, RATE_WINDOW_SECONDS)
 
 
 # =========================================================
-# ДОБИВКА ОДНОЙ СЦЕНЫ
+# ФАЗА 1: ДОБИВКА КАРТИНОК
 # =========================================================
 
-def repair_one(image_path: Path, scene: Optional[Scene], known_names: set) -> dict:
+def generate_scene_image_with_ladder(out_path: Path, scene: Optional[Scene],
+                                      known_names: set) -> Tuple[bool, str, str, Optional[str]]:
+    """Генерирует картинку сцены с эскалацией. Возвращает (ok, mode, prompt, generation_id)."""
+    aliases = list(scene.aliases) if scene else []
+    base_prompt = scene_image_base_prompt(scene)
+    detached = False
+
+    # ---- Фаза A: С ПЕРСОНАЖЕМ ----
+    if aliases:
+        for a in range(1, CHARACTER_ATTEMPTS + 1):
+            if a == 1:
+                prompt = base_prompt
+            elif a == 2:
+                prompt = heuristic_sanitize(base_prompt, 1)      # имена сохранены
+            else:
+                prompt = rewrite_keep_character(base_prompt)     # LLM/усиленный, имена сохранены
+            log(f"    [IMG С ПЕРСОНАЖЕМ] попытка {a}/{CHARACTER_ATTEMPTS}")
+            try:
+                gen = generate_image_attempt(prompt, out_path)
+                return True, f"with_character_{a}", prompt, gen
+            except PermanentError as e:
+                log(f"    [IMG С ПЕРСОНАЖЕМ] попытка {a} заблокирована: {e}")
+            except TransientError as e:
+                log(f"    [IMG С ПЕРСОНАЖЕМ] попытка {a} не удалась: {e}")
+        detached = True
+        log(f"    3 неудачи -> ОТВЯЗЫВАЮ картинку от персонажа ({', '.join(aliases)})")
+
+    # ---- Фаза B: отвязка / нейтрально ----
+    detached_base = rewrite_anonymize(base_prompt, aliases, known_names) if aliases else base_prompt
+    ladder = [
+        ("img-detached" if aliases else "img-original", detached_base),
+        ("img-detached-sanitized" if aliases else "img-sanitized", heuristic_sanitize(detached_base, 2)),
+        ("img-safe-fallback", SAFE_IMAGE_FALLBACK),
+    ]
+    for mode, prompt in ladder:
+        log(f"    [{mode}]")
+        try:
+            gen = generate_image_attempt(prompt, out_path)
+            return True, (mode + ("+detached" if detached else "")), prompt, gen
+        except PermanentError as e:
+            log(f"    [{mode}] заблокировано: {e} — эскалирую")
+        except TransientError as e:
+            log(f"    [{mode}] не удалось: {e} — эскалирую")
+
+    # ---- Последний рубеж: безопасный fallback несколько раз (страховка от сети) ----
+    for extra in range(1, EXTRA_GUARANTEED_ROUNDS + 1):
+        log(f"    [img-safe-fallback доп.заход {extra}/{EXTRA_GUARANTEED_ROUNDS}]")
+        try:
+            gen = generate_image_attempt(SAFE_IMAGE_FALLBACK, out_path)
+            return True, "img-safe-fallback", SAFE_IMAGE_FALLBACK, gen
+        except Exception as e:
+            log(f"    img доп.заход {extra} не удался: {e}")
+
+    return False, "failed", base_prompt, None
+
+
+def repair_image(idx: int, scene: Optional[Scene], known_names: set) -> dict:
+    out_path = image_path_for_index(idx)
+    aliases = list(scene.aliases) if scene else []
+    log(f"[IMG-REPAIR] сцена {idx:04d} -> {out_path.name} "
+        f"({'персонаж: ' + ', '.join(aliases) if aliases else 'без персонажа'})")
+
+    ok, mode, prompt, gen = generate_scene_image_with_ladder(out_path, scene, known_names)
+    if ok:
+        log(f"    OK картинка ({mode}): {out_path.name}")
+        return {"index": idx, "output": str(out_path), "status": "success",
+                "mode": mode, "aliases": aliases, "prompt": prompt, "generation_id": gen}
+
+    log(f"    FAILED картинка окончательно: {out_path.name}")
+    return {"index": idx, "output": str(out_path), "status": "failed",
+            "reason": "exhausted", "aliases": aliases,
+            "error": "не удалось сгенерировать даже безопасный fallback (проверь сеть/ключ/лимиты)"}
+
+
+# =========================================================
+# ГЛУБОКИЙ FALLBACK: ПЕРЕДЕЛКА САМОЙ КАРТИНКИ
+# =========================================================
+
+def safe_image_prompt_for(scene: Optional[Scene], known_names: set, level: int) -> str:
+    """Промпт для переделки картинки, по нарастанию безопасности."""
+    base = scene_image_base_prompt(scene)
+    aliases = list(scene.aliases) if scene else []
+    if level <= 1:
+        return rewrite_anonymize(base, aliases, known_names)
+    if level == 2:
+        return heuristic_sanitize(anonymize(base, aliases, known_names), 2)
+    return SAFE_IMAGE_FALLBACK
+
+
+def regenerate_scene_image(image_path: Path, scene: Optional[Scene], known_names: set, level: int) -> str:
+    """Переделывает саму картинку новым безопасным промптом (перезаписывает файл).
+    Оригинал бэкапится в КАРТИНКИ/_regen_backup/ (один раз)."""
+    if REGEN_IMAGE_BACKUP and image_path.exists():
+        backup_dir = image_path.parent / "_regen_backup"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup = backup_dir / image_path.name
+        if not backup.exists():
+            try:
+                shutil.copy2(image_path, backup)
+            except Exception as e:
+                log(f"      [regen] не смог сделать бэкап {image_path.name}: {e}")
+    prompt = safe_image_prompt_for(scene, known_names, level)
+    return generate_image_attempt(prompt, image_path)
+
+
+# =========================================================
+# ФАЗА 2: ДОБИВКА ВИДЕО (с логикой персонажей + глубокий fallback переделки картинки)
+# =========================================================
+
+def repair_one(image_path: Path, scene: Optional[Scene], known_names: set,
+               allow_image_regen: bool = True) -> dict:
     out_path = VIDEOS_DIR / f"{image_path.stem}.mp4"
     aliases = list(scene.aliases) if scene else []
     body = (scene.body if scene and scene.body else "").strip()
     original_prompt = remove_brackets(body) if body else DEFAULT_ANIMATION_PROMPT
 
-    log(f"[REPAIR] {image_path.name} -> {out_path.name} "
+    log(f"[VID-REPAIR] {image_path.name} -> {out_path.name} "
         f"({'персонаж: ' + ', '.join(aliases) if aliases else 'без персонажа'})")
 
     try:
@@ -749,17 +1002,17 @@ def repair_one(image_path: Path, scene: Optional[Scene], known_names: set) -> di
                 prompt = heuristic_sanitize(original_prompt, 1)   # имена сохранены
             else:
                 prompt = rewrite_keep_character(original_prompt)  # LLM/усиленный, имена сохранены
-            log(f"    [С ПЕРСОНАЖЕМ] попытка {a}/{CHARACTER_ATTEMPTS}")
+            log(f"    [VID С ПЕРСОНАЖЕМ] попытка {a}/{CHARACTER_ATTEMPTS}")
             try:
-                gen = generate_attempt(prompt, image_data_uri, out_path)
+                gen = generate_video_attempt(prompt, image_data_uri, out_path)
                 log(f"    OK (с персонажем, попытка {a}): {out_path.name}")
                 return {"image": str(image_path), "output": str(out_path), "status": "success",
                         "mode": "with_character", "character_attempt": a, "detached": False,
                         "aliases": aliases, "prompt": prompt, "generation_id": gen}
             except PermanentError as e:
-                log(f"    [С ПЕРСОНАЖЕМ] попытка {a} заблокирована: {e}")
+                log(f"    [VID С ПЕРСОНАЖЕМ] попытка {a} заблокирована: {e}")
             except TransientError as e:
-                log(f"    [С ПЕРСОНАЖЕМ] попытка {a} не удалась: {e}")
+                log(f"    [VID С ПЕРСОНАЖЕМ] попытка {a} не удалась: {e}")
         detached = True
         log(f"    3 неудачи подряд -> ОТВЯЗЫВАЮ от персонажа ({', '.join(aliases)})")
 
@@ -778,7 +1031,7 @@ def repair_one(image_path: Path, scene: Optional[Scene], known_names: set) -> di
     for mode, prompt in ladder:
         log(f"    [{mode}]")
         try:
-            gen = generate_attempt(prompt, image_data_uri, out_path)
+            gen = generate_video_attempt(prompt, image_data_uri, out_path)
             log(f"    OK ({mode}): {out_path.name}")
             return {"image": str(image_path), "output": str(out_path), "status": "success",
                     "mode": mode, "detached": detached or bool(aliases), "aliases": aliases,
@@ -788,13 +1041,11 @@ def repair_one(image_path: Path, scene: Optional[Scene], known_names: set) -> di
         except TransientError as e:
             log(f"    [{mode}] не удалось: {e} — эскалирую")
 
-    # ---- Последний рубеж: motion-minimal несколько раз (страховка от перегрузки/сети) ----
-    # Каждый заход сам переживает временные ошибки; ловим ещё и Permanent на случай
-    # редкого интермиттент-safety от перегруженного провайдера.
+    # ---- Ступень motion-minimal несколько раз (страховка от перегрузки/сети) ----
     for extra in range(1, EXTRA_GUARANTEED_ROUNDS + 1):
         log(f"    [motion-minimal доп.заход {extra}/{EXTRA_GUARANTEED_ROUNDS}]")
         try:
-            gen = generate_attempt(MOTION_MINIMAL_PROMPT, image_data_uri, out_path)
+            gen = generate_video_attempt(MOTION_MINIMAL_PROMPT, image_data_uri, out_path)
             log(f"    OK (доп {extra}): {out_path.name}")
             return {"image": str(image_path), "output": str(out_path), "status": "success",
                     "mode": "motion-minimal", "detached": detached or bool(aliases),
@@ -802,10 +1053,45 @@ def repair_one(image_path: Path, scene: Optional[Scene], known_names: set) -> di
         except Exception as e:
             log(f"    доп.заход {extra} не удался: {e}")
 
+    # ---- ГЛУБОКИЙ FALLBACK: переделываем САМУ КАРТИНКУ и оживляем новую ----
+    # Обычно если видео не выходит вообще — проблема в самой картинке (в ней "вшит" персонаж/сюжет,
+    # который валит video-фильтр). Переделываем картинку безопасным промптом и оживляем её.
+    if allow_image_regen and REGEN_IMAGE_WHEN_STUCK and scene is not None and (scene.image_body or scene.body):
+        for r in range(1, IMAGE_REGEN_ROUNDS + 1):
+            level = 1 if r == 1 else (2 if r == 2 else 3)
+            log(f"    [REGEN-IMAGE раунд {r}/{IMAGE_REGEN_ROUNDS}, level={level}] "
+                f"переделываю САМУ картинку {image_path.name}")
+            try:
+                image_gen = regenerate_scene_image(image_path, scene, known_names, level)
+            except PermanentError as e:
+                log(f"    [REGEN-IMAGE {r}] картинка заблокирована: {e}")
+                continue
+            except Exception as e:
+                log(f"    [REGEN-IMAGE {r}] не удалось переделать картинку: {e}")
+                continue
+
+            try:
+                new_uri = image_to_data_uri(image_path)
+            except Exception as e:
+                log(f"    [REGEN-IMAGE {r}] новая картинка не читается: {e}")
+                continue
+
+            for vmode, vprompt in (("motion-preserve", MOTION_PRESERVE_PROMPT),
+                                   ("motion-minimal", MOTION_MINIMAL_PROMPT)):
+                try:
+                    gen = generate_video_attempt(vprompt, new_uri, out_path)
+                    log(f"    OK (картинка переделана, раунд {r}, {vmode}): {out_path.name}")
+                    return {"image": str(image_path), "output": str(out_path), "status": "success",
+                            "mode": f"image-regenerated+{vmode}", "detached": True,
+                            "image_regenerated": True, "image_regen_round": r, "aliases": aliases,
+                            "prompt": vprompt, "generation_id": gen, "image_generation_id": image_gen}
+                except Exception as e:
+                    log(f"    [REGEN-IMAGE {r}/{vmode}] оживление не удалось: {e}")
+
     log(f"    FAILED окончательно: {out_path.name}")
     return {"image": str(image_path), "output": str(out_path), "status": "failed",
             "reason": "exhausted", "aliases": aliases, "detached": detached,
-            "error": "не удалось даже motion-minimal (проверь сеть/ключ/лимиты)"}
+            "error": "не удалось даже после переделки картинки (проверь сеть/ключ/лимиты)"}
 
 
 # =========================================================
@@ -813,6 +1099,7 @@ def repair_one(image_path: Path, scene: Optional[Scene], known_names: set) -> di
 # =========================================================
 
 results_log: List[Dict[str, Any]] = []
+image_results_log: List[Dict[str, Any]] = []
 
 
 def append_result(item: Dict[str, Any]) -> None:
@@ -820,6 +1107,13 @@ def append_result(item: Dict[str, Any]) -> None:
         results_log.append(item)
         results_log.sort(key=lambda x: str(x.get("output", "")))
         save_json(LOG_FILE, results_log)
+
+
+def append_image_result(item: Dict[str, Any]) -> None:
+    with image_results_lock:
+        image_results_log.append(item)
+        image_results_log.sort(key=lambda x: str(x.get("output", "")))
+        save_json(IMAGE_LOG_FILE, image_results_log)
 
 
 def existing_video(image_path: Path, videos_dir: Path) -> bool:
@@ -830,50 +1124,73 @@ def existing_video(image_path: Path, videos_dir: Path) -> bool:
         return False
 
 
-def main() -> None:
-    global BASE_URL, IMAGES_DIR, VIDEOS_DIR, results_log
+def run_image_phase(scenes: Dict[int, Scene], known_names: set,
+                    dry_run: bool, limit: int) -> None:
+    """ФАЗА 1: генерируем недостающие картинки для сцен, у которых есть промпт."""
+    global image_results_log
 
-    parser = argparse.ArgumentParser(
-        description="Добивка видео до 100% (image->video flower/Veo 3.1) с логикой персонажей: 3 попытки с персонажем, затем отвязка."
-    )
-    parser.add_argument("--images-dir", default=str(IMAGES_DIR))
-    parser.add_argument("--videos-dir", default=str(VIDEOS_DIR))
-    parser.add_argument("--api-base", default=BASE_URL)
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--limit", type=int, default=0, help="Максимум пропусков за запуск (0 = все).")
-    args = parser.parse_args()
+    have = existing_image_indices()
+    missing_idx = sorted(idx for idx in scenes.keys() if idx not in have)
 
-    if not API_KEY:
-        raise SystemExit('Не найден API ключ. export FAST_GEN_API_KEY="ТВОЙ_КЛЮЧ"')
+    with_char = sum(1 for idx in missing_idx if scenes[idx].aliases)
+    log("\n===== ФАЗА 1: ДОБИВКА КАРТИНОК =====")
+    log(f"Сцен с промптом: {len(scenes)}; уже с картинкой: {len(scenes) - len(missing_idx)}; "
+        f"нет картинки: {len(missing_idx)} (с персонажем: {with_char})")
 
-    BASE_URL = args.api_base
-    IMAGES_DIR = Path(args.images_dir).expanduser()
-    VIDEOS_DIR = Path(args.videos_dir).expanduser()
-    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    if not missing_idx:
+        log("Картинки на месте — пропускаю фазу 1.")
+        return
+    if missing_idx:
+        preview = ", ".join(f"{i:04d}" for i in missing_idx[:30])
+        more = "" if len(missing_idx) <= 30 else f" … (+{len(missing_idx) - 30})"
+        log(f"Нет картинок для: {preview}{more}")
+    if dry_run:
+        log("[DRY-RUN] картинки не генерирую.")
+        return
+    if limit and limit > 0:
+        missing_idx = missing_idx[:limit]
+        log(f"[LIMIT] Обрабатываю первые {len(missing_idx)} картинок.")
+
+    loaded = load_json(IMAGE_LOG_FILE, [])
+    image_results_log = loaded if isinstance(loaded, list) else []
+
+    workers = max(1, min(MAX_IMAGE_WORKERS, len(missing_idx)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(repair_image, idx, scenes[idx], known_names): idx for idx in missing_idx}
+        for future in as_completed(futures):
+            try:
+                append_image_result(future.result())
+            except Exception as e:
+                log(f"[IMG-FUTURE-ERROR] {e}")
+
+    ok = sum(1 for r in image_results_log if r.get("status") == "success")
+    fail = sum(1 for r in image_results_log if r.get("status") != "success")
+    log(f"Фаза 1 итог: успехов в логе {ok}, неудач {fail}.")
+
+
+def run_video_phase(scenes: Dict[int, Scene], known_names: set,
+                    dry_run: bool, limit: int, allow_image_regen: bool) -> None:
+    """ФАЗА 2: оживляем картинки, для которых нет видео."""
+    global results_log
 
     images = list_images()
     if not images:
-        raise SystemExit(f"В папке нет картинок: {IMAGES_DIR}")
-
-    scenes_map = load_scenes_map()
-    known_names = load_known_names()
+        log("\n===== ФАЗА 2: ДОБИВКА ВИДЕО =====")
+        log(f"В папке нет картинок: {IMAGES_DIR} — пропускаю фазу 2.")
+        return
 
     missing: List[Tuple[Path, Optional[Scene]]] = []
     for order, image_path in enumerate(images, start=1):
         if existing_video(image_path, VIDEOS_DIR):
             continue
-        scene = scenes_map.get(scene_index_for(image_path, order)) or scenes_map.get(order)
+        idx = scene_index_for(image_path, order)
+        scene = scenes.get(idx) or scenes.get(order)
         missing.append((image_path, scene))
 
     with_char = sum(1 for _p, s in missing if s and s.aliases)
-
-    log("ДОБИВКА видео с логикой персонажей (image->video flower / Veo 3.1)")
-    log(f"BASE_URL: {BASE_URL}")
-    log(f"Картинки: {IMAGES_DIR}")
-    log(f"Видео:    {VIDEOS_DIR}")
+    log("\n===== ФАЗА 2: ДОБИВКА ВИДЕО =====")
     log(f"Video operation: {VIDEO_OPERATION} (flower / flower-video / Veo 3.1)")
-    log(f"OpenAI переписывание: {'ДА' if os.getenv('OPENAI_API_KEY') else 'нет (эвристика)'}")
-    log(f"Попыток с персонажем до отвязки: {CHARACTER_ATTEMPTS}")
+    log(f"Переделка картинки при затыке: {'ДА' if (allow_image_regen and REGEN_IMAGE_WHEN_STUCK) else 'нет'}")
     log(f"Всего картинок: {len(images)}; уже с видео: {len(images) - len(missing)}; пропущено: {len(missing)}")
     log(f"Из пропусков с персонажем: {with_char}")
 
@@ -883,13 +1200,13 @@ def main() -> None:
         log(f"Индексы пропусков: {preview}{more}")
 
     if not missing:
-        log("Всё на месте — 100% ✅")
+        log("Все видео на месте — пропускаю фазу 2.")
         return
-    if args.dry_run:
-        log("[DRY-RUN] генерацию не запускаю.")
+    if dry_run:
+        log("[DRY-RUN] видео не генерирую.")
         return
-    if args.limit and args.limit > 0:
-        missing = missing[:args.limit]
+    if limit and limit > 0:
+        missing = missing[:limit]
         log(f"[LIMIT] Обрабатываю первые {len(missing)} пропусков.")
 
     loaded = load_json(LOG_FILE, [])
@@ -897,16 +1214,19 @@ def main() -> None:
 
     workers = max(1, min(MAX_VIDEO_WORKERS, len(missing)))
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(repair_one, img, scene, known_names): img for img, scene in missing}
+        futures = {
+            executor.submit(repair_one, img, scene, known_names, allow_image_regen): img
+            for img, scene in missing
+        }
         for future in as_completed(futures):
             try:
                 append_result(future.result())
             except Exception as e:
                 log(f"[FUTURE-ERROR] {e}")
 
-    # Список отвязанных сцен -> отдельный файл.
     detached_list = [
-        {"image": r.get("image"), "output": r.get("output"), "aliases": r.get("aliases"), "mode": r.get("mode")}
+        {"image": r.get("image"), "output": r.get("output"), "aliases": r.get("aliases"),
+         "mode": r.get("mode"), "image_regenerated": r.get("image_regenerated", False)}
         for r in results_log if r.get("status") == "success" and r.get("detached")
     ]
     if detached_list:
@@ -914,18 +1234,76 @@ def main() -> None:
 
     ok = sum(1 for r in results_log if r.get("status") == "success")
     fail = sum(1 for r in results_log if r.get("status") != "success")
+    regen = sum(1 for r in results_log if r.get("image_regenerated"))
     still_missing = [p for p in list_images() if not existing_video(p, VIDEOS_DIR)]
 
-    log("\n========== ИТОГ ==========")
+    log("\n========== ИТОГ ВИДЕО ==========")
     log(f"  Успехов в логе: {ok}, неудач: {fail}")
     log(f"  Отвязано от персонажа: {len(detached_list)}"
         + (f" (см. {DETACHED_FILE.name})" if detached_list else ""))
+    log(f"  Картинок переделано в fallback: {regen}")
     log(f"  Итоговое покрытие: {len(list_images()) - len(still_missing)}/{len(list_images())}")
     if not still_missing:
         log("  ГОТОВО: 100% видео ✅")
     else:
         preview = ", ".join(p.stem for p in still_missing[:30])
         log(f"  Осталось пропусков: {len(still_missing)} ({preview}). Обычно сеть/лимиты — запусти ещё раз.")
+
+
+def main() -> None:
+    global BASE_URL, IMAGES_DIR, VIDEOS_DIR
+
+    parser = argparse.ArgumentParser(
+        description="Добивка КАРТИНОК и ВИДЕО до 100% (flower / Veo 3.1) с логикой персонажей "
+                    "и переделкой самой картинки при затыке видео."
+    )
+    parser.add_argument("--images-dir", default=str(IMAGES_DIR))
+    parser.add_argument("--videos-dir", default=str(VIDEOS_DIR))
+    parser.add_argument("--api-base", default=BASE_URL)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--images-only", action="store_true", help="Только добивка картинок (фаза 1).")
+    parser.add_argument("--videos-only", action="store_true", help="Только добивка видео (фаза 2).")
+    parser.add_argument("--no-image-regen", action="store_true",
+                        help="Не переделывать саму картинку в глубоком fallback видео.")
+    parser.add_argument("--limit", type=int, default=0, help="Максимум задач за запуск на фазу (0 = все).")
+    args = parser.parse_args()
+
+    if not API_KEY:
+        raise SystemExit('Не найден API ключ. export FAST_GEN_API_KEY="ТВОЙ_КЛЮЧ"')
+
+    BASE_URL = args.api_base
+    IMAGES_DIR = Path(args.images_dir).expanduser()
+    VIDEOS_DIR = Path(args.videos_dir).expanduser()
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+
+    scenes = load_scenes()
+    known_names = load_known_names()
+
+    do_images = not args.videos_only
+    do_videos = not args.images_only
+    allow_image_regen = not args.no_image_regen
+
+    log("ДОБИВКА картинок и видео (flower / Veo 3.1) с логикой персонажей")
+    log(f"BASE_URL: {BASE_URL}")
+    log(f"Картинки: {IMAGES_DIR}")
+    log(f"Видео:    {VIDEOS_DIR}")
+    log(f"Image operation: {IMAGE_OPERATION} (flower / flower-image)")
+    log(f"OpenAI переписывание: {'ДА' if os.getenv('OPENAI_API_KEY') else 'нет (эвристика)'}")
+    log(f"Попыток с персонажем до отвязки: {CHARACTER_ATTEMPTS}")
+
+    if do_images and not scenes:
+        log("[WARN] Нет промптов — фазу картинок пропускаю (нечего генерировать).")
+        do_images = False
+
+    if do_images:
+        run_image_phase(scenes, known_names, dry_run=args.dry_run, limit=args.limit)
+
+    if do_videos:
+        run_video_phase(scenes, known_names, dry_run=args.dry_run, limit=args.limit,
+                        allow_image_regen=allow_image_regen)
+
+    log("\nALL DONE")
 
 
 if __name__ == "__main__":
