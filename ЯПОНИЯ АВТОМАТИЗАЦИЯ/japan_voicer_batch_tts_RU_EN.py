@@ -108,6 +108,11 @@ MAX_WAIT_SECONDS = 0
 
 REQUEST_TIMEOUT = 120
 
+# Сетевые ретраи. Voicer иногда рвёт соединение (Connection reset by peer).
+# Скрипт повторяет запрос с нарастающей паузой, а не падает от первого обрыва.
+MAX_NETWORK_RETRIES = 8
+NETWORK_RETRY_BASE_DELAY = 5   # секунды: пауза = base * попытка (5,10,15,...), максимум 60
+
 # Разбивка длинного текста на чанки (символы). None = не передавать поле.
 CHUNK_SIZE: Optional[int] = 2000
 
@@ -161,6 +166,9 @@ def all_txt_files() -> list[Path]:
     files = []
     for pattern in ("*.txt", "*.TXT"):
         files.extend(SCENARIOS_DIR.glob(pattern))
+    # Игнорируем служебные файлы-заглушки и readme, чтобы они не попадали в сценарии.
+    ignore_prefixes = ("ПОЛОЖИ_СЮДА", "ЧИТАЙ_МЕНЯ", ".keep")
+    files = [p for p in files if not p.name.upper().startswith(tuple(x.upper() for x in ignore_prefixes))]
     return sorted(set(files), key=lambda p: p.name.lower())
 
 
@@ -252,29 +260,51 @@ def pretty_json(data) -> str:
         return str(data)
 
 
+def _retry_delay(attempt: int) -> int:
+    return min(60, NETWORK_RETRY_BASE_DELAY * attempt)
+
+
 def request_json(method: str, base_url: str, path: str, *, json_body: Optional[dict] = None) -> dict:
     url = base_url.rstrip("/") + path
 
-    try:
-        response = requests.request(
-            method=method,
-            url=url,
-            headers=json_headers(),
-            json=json_body,
-            timeout=REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Ошибка соединения с {url}: {exc}") from exc
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, MAX_NETWORK_RETRIES + 1):
+        try:
+            response = requests.request(
+                method=method,
+                url=url,
+                headers=json_headers(),
+                json=json_body,
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException as exc:
+            # Обрыв соединения / таймаут / reset — повторяем с паузой.
+            last_exc = exc
+            if attempt >= MAX_NETWORK_RETRIES:
+                break
+            delay = _retry_delay(attempt)
+            log(f"[NET] {method} {url}: попытка {attempt}/{MAX_NETWORK_RETRIES} не удалась ({exc}). Повтор через {delay}s...")
+            time.sleep(delay)
+            continue
 
-    try:
-        data = response.json()
-    except Exception:
-        data = {"raw_text": response.text}
+        # Ретраим временные серверные статусы (429 и 5xx); остальное отдаём как есть.
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < MAX_NETWORK_RETRIES:
+            delay = _retry_delay(attempt)
+            log(f"[NET] {method} {url}: HTTP {response.status_code}, попытка {attempt}/{MAX_NETWORK_RETRIES}. Повтор через {delay}s...")
+            time.sleep(delay)
+            continue
 
-    if response.status_code >= 400:
-        raise RuntimeError(f"HTTP {response.status_code} от {url}\nОтвет:\n{pretty_json(data)}")
+        try:
+            data = response.json()
+        except Exception:
+            data = {"raw_text": response.text}
 
-    return data
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code} от {url}\nОтвет:\n{pretty_json(data)}")
+
+        return data
+
+    raise RuntimeError(f"Ошибка соединения с {url} после {MAX_NETWORK_RETRIES} попыток: {last_exc}")
 
 
 def choose_working_base_url() -> str:
@@ -402,10 +432,37 @@ def guess_ext_from_response(response: requests.Response) -> str:
 def download_result(base_url: str, task_id: int, out_base: Path) -> Path:
     url = base_url.rstrip("/") + f"/tasks/{task_id}/result"
 
-    try:
-        response = requests.get(url, headers=download_headers(), timeout=REQUEST_TIMEOUT)
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Ошибка скачивания результата {url}: {exc}") from exc
+    response = None
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, MAX_NETWORK_RETRIES + 1):
+        try:
+            response = requests.get(url, headers=download_headers(), timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt >= MAX_NETWORK_RETRIES:
+                raise RuntimeError(f"Ошибка скачивания результата {url} после {MAX_NETWORK_RETRIES} попыток: {exc}") from exc
+            delay = _retry_delay(attempt)
+            log(f"[NET] download {url}: попытка {attempt}/{MAX_NETWORK_RETRIES} не удалась ({exc}). Повтор через {delay}s...")
+            time.sleep(delay)
+            continue
+
+        # 202 = ещё не готово; сервер иногда так отвечает сразу после статуса. Ждём и повторяем.
+        if response.status_code == 202 and attempt < MAX_NETWORK_RETRIES:
+            delay = _retry_delay(attempt)
+            log(f"[NET] результат ещё не готов (202), попытка {attempt}/{MAX_NETWORK_RETRIES}. Повтор через {delay}s...")
+            time.sleep(delay)
+            continue
+
+        if response.status_code in (429, 500, 502, 503, 504) and attempt < MAX_NETWORK_RETRIES:
+            delay = _retry_delay(attempt)
+            log(f"[NET] download HTTP {response.status_code}, попытка {attempt}/{MAX_NETWORK_RETRIES}. Повтор через {delay}s...")
+            time.sleep(delay)
+            continue
+
+        break
+
+    if response is None:
+        raise RuntimeError(f"Не удалось скачать результат {url}: {last_exc}")
 
     if response.status_code == 202:
         raise RuntimeError(f"Файл ещё не готов, хотя статус уже проверен. Ответ: {response.text}")
