@@ -11,9 +11,10 @@
 
 Этот скрипт добивает то, что НЕ сгенерировалось на шагах 2 и 3.
 
-Провайдер: flower (картинки — flower-image, видео — flower-video / Veo 3.1).
-  • Картинки: operation flower_image_generate.
-  • Видео:    operation flower_video_from_image.
+Провайдеры: картинки — flower (flower-image), видео — flow (flow-video-fast).
+  • Картинки: operation flower_image_generate (пул flower свободен).
+  • Видео:    operation flow_video_from_ingredients (у Veo/flower пул часто пуст —
+    "нет доступных аккаунтов", поэтому видео делаем на flow).
 
 Что делает (две фазы):
 
@@ -132,8 +133,10 @@ MAX_VIDEO_WORKERS = int(os.getenv("FAST_GEN_VIDEO_WORKERS", "6"))
 MAX_IMAGE_WORKERS = int(os.getenv("FAST_GEN_IMAGE_WORKERS", "6"))
 
 ASPECT_RATIO = os.getenv("FAST_GEN_VIDEO_ASPECT_RATIO", "16:9")
-# Canonical V6 operation id для image->video на flower (Veo 3.1).
-VIDEO_OPERATION = os.getenv("FAST_GEN_VIDEO_OPERATION", "flower_video_from_image")
+# Canonical V6 operation id для image->video на flow (модель flow-video-fast).
+# Flow, а НЕ flower/Veo: у Veo пул аккаунтов часто пуст ("нет доступных аккаунтов"),
+# а flow-видео стабильно доступно. Картинки при этом остаются на flower (пул свободен).
+VIDEO_OPERATION = os.getenv("FAST_GEN_VIDEO_OPERATION", "flow_video_from_ingredients")
 VIDEO_MODEL = os.getenv("FAST_GEN_VIDEO_MODEL") or None
 
 # Canonical V6 operation id для генерации картинок на flower (flower-image).
@@ -146,7 +149,8 @@ GENERATION_SEED: Optional[int] = int(_SEED_ENV) if _SEED_ENV.lstrip("-").isdigit
 _DURATION_ENV = os.getenv("FAST_GEN_VIDEO_DURATION_SECONDS", "").strip()
 VIDEO_DURATION_SECONDS: Optional[int] = int(_DURATION_ENV) if _DURATION_ENV.isdigit() else None
 VIDEO_RESOLUTION = os.getenv("FAST_GEN_VIDEO_RESOLUTION") or None
-# ВНИМАНИЕ: ultra и keyframes — только flow-video, для flower не используются.
+# ultra: только Flow video — Ultra-tier аккаунты/лимиты (для flower не применяется).
+VIDEO_ULTRA = os.getenv("FAST_GEN_VIDEO_ULTRA", "").strip().lower() in {"1", "true", "yes", "on"}
 
 # ГЛУБОКИЙ FALLBACK: переделывать саму картинку, если видео упорно не выходит.
 def _env_bool(name: str, default: bool) -> bool:
@@ -749,7 +753,8 @@ def build_video_payload(prompt: str, image_data_uri: str) -> Dict[str, Any]:
         payload["duration_seconds"] = VIDEO_DURATION_SECONDS
     if VIDEO_RESOLUTION:
         payload["resolution"] = VIDEO_RESOLUTION
-    # ВНИМАНИЕ: ultra и keyframes — только flow-video, для flower не отправляем.
+    if VIDEO_ULTRA:
+        payload["ultra"] = True
     return payload
 
 
@@ -1247,7 +1252,7 @@ def run_video_phase(scenes: Dict[int, Scene], known_names: set,
 
     with_char = sum(1 for _p, s in missing if s and s.aliases)
     log("\n===== ФАЗА 2: ДОБИВКА ВИДЕО =====")
-    log(f"Video operation: {VIDEO_OPERATION} (flower / flower-video / Veo 3.1)")
+    log(f"Video operation: {VIDEO_OPERATION} (flow / flow-video-fast)")
     log(f"Переделка картинки при затыке: {'ДА' if (allow_image_regen and REGEN_IMAGE_WHEN_STUCK) else 'нет'}")
     log(f"Всего картинок: {len(images)}; уже с видео: {len(images) - len(missing)}; пропущено: {len(missing)}")
     log(f"Из пропусков с персонажем: {with_char}")
@@ -1312,7 +1317,7 @@ def main() -> None:
     global BASE_URL, IMAGES_DIR, VIDEOS_DIR
 
     parser = argparse.ArgumentParser(
-        description="Добивка КАРТИНОК и ВИДЕО до 100% (flower / Veo 3.1) с логикой персонажей "
+        description="Добивка КАРТИНОК (flower) и ВИДЕО (flow) до 100% с логикой персонажей "
                     "и переделкой самой картинки при затыке видео."
     )
     parser.add_argument("--images-dir", default=str(IMAGES_DIR))
@@ -1342,7 +1347,7 @@ def main() -> None:
     do_videos = not args.images_only
     allow_image_regen = not args.no_image_regen
 
-    log("ДОБИВКА картинок и видео (flower / Veo 3.1) с логикой персонажей")
+    log("ДОБИВКА картинок (flower) и видео (flow) с логикой персонажей")
     log(f"BASE_URL: {BASE_URL}")
     log(f"Картинки: {IMAGES_DIR}")
     log(f"Видео:    {VIDEOS_DIR}")

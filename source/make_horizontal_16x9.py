@@ -19,7 +19,7 @@
     • сканирует ВИДЕО/, определяет размеры (ffprobe -> иначе разбор mp4/tkhd);
     • вертикальные видео (а также видео, чья картинка была только что перегенерирована)
       ПЕРЕДЕЛЫВАЕТ горизонтально: оживляет уже ГОРИЗОНТАЛЬНУЮ картинку через
-      flower_video_from_image (Veo 3.1) с aspect_ratio 16:9;
+      flow_video_from_ingredients (flow) с aspect_ratio 16:9;
     • старое видео бэкапится в ВИДЕО/_vertical_backup/.
 
 Переиспользует flower-логику (генерация, промпты, анонимизация) из
@@ -524,7 +524,7 @@ def main() -> None:
     do_images = not args.videos_only
     do_videos = not args.images_only
 
-    log("ГОРИЗОНТАЛИЗАЦИЯ (flower / Veo 3.1)")
+    log("ГОРИЗОНТАЛИЗАЦИЯ (картинки — flower, видео — flow)")
     log(f"Картинки: {images_dir}")
     log(f"Видео:    {videos_dir}")
     log(f"Целевое соотношение: {target}")

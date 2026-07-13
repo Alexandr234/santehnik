@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Оживление локальных картинок в видео через media_gen_api V6 (провайдер flower,
-модель flower-video = Veo 3.1) без storage upload.
+Оживление локальных картинок в видео через media_gen_api V6 (провайдер flow,
+операция flow_video_from_ingredients) без storage upload.
 
 Что делает:
 1. Берёт картинки из папки:
@@ -20,15 +20,13 @@
 
 Соответствие документации media_gen_api V6 (openapi 3.1.0):
    - генерация идёт через единый endpoint POST /api/v6/generations
-     (GenerationCreateRequest) с canonical operation id flower_video_from_image
-     (провайдер flower, модель flower-video / Veo 3.1, 1 кредит);
-   - картинка передаётся в inputs[] как V6MediaInput
+     (GenerationCreateRequest) с canonical operation id flow_video_from_ingredients
+     (провайдер flow, модель flow-video-fast, 1 кредит);
+   - картинка-ингредиент передаётся в inputs[] как V6MediaInput
      (data URI прямо в запросе, до 5 MB на inline-картинку);
    - aspect_ratio в форме n:n (^[1-9]\\d*:[1-9]\\d*$), напр. 16:9 / 9:16;
-   - опциональные параметры запроса: seed, duration_seconds, resolution —
+   - опциональные параметры запроса: seed, duration_seconds, resolution, ultra —
      отправляются только если заданы через env;
-   - ВНИМАНИЕ: параметры ultra и keyframes относятся ТОЛЬКО к flow-video и для
-     flower не отправляются;
    - ответ на создание — GenerationAcceptedResponse (поле id);
    - статус через GET /api/v6/generations/{generation_id} -> GenerationStatusResponse:
      status = queued|running|succeeded|failed, results[], warnings, error, translations;
@@ -89,11 +87,12 @@ MAX_RETRIES = 4
 # V6 требует aspect_ratio в форме n:n, например 16:9 (ландшафт) или 9:16 (вертикаль).
 ASPECT_RATIO = os.getenv("FAST_GEN_VIDEO_ASPECT_RATIO", "16:9")
 
-# Canonical V6 operation id для image->video на flower (Veo 3.1).
-# См. GET /api/v6/capabilities — flower_video_from_image, provider=flower,
-# model=flower-video, 1 кредит.
-VIDEO_OPERATION = os.getenv("FAST_GEN_VIDEO_OPERATION", "flower_video_from_image")
-# Необязательный shorthand-model. По умолчанию flower-video (Veo 3.1).
+# Canonical V6 operation id для image->video на flow (модель flow-video-fast).
+# См. GET /api/v6/capabilities — flow_video_from_ingredients, provider=flow, 1 кредит.
+# Flow, а НЕ flower/Veo: у Veo пул аккаунтов часто пуст ("нет доступных аккаунтов"),
+# а flow-видео стабильно доступно.
+VIDEO_OPERATION = os.getenv("FAST_GEN_VIDEO_OPERATION", "flow_video_from_ingredients")
+# Необязательный shorthand-model (например flow-video-lite / flow-video-quality).
 VIDEO_MODEL = os.getenv("FAST_GEN_VIDEO_MODEL") or None
 
 # Опциональные параметры генерации (отправляются только если заданы через env).
@@ -106,13 +105,16 @@ VIDEO_DURATION_SECONDS: Optional[int] = int(_DURATION_ENV) if _DURATION_ENV.isdi
 # resolution: например 480p или 720p (когда поддерживается моделью).
 VIDEO_RESOLUTION = os.getenv("FAST_GEN_VIDEO_RESOLUTION") or None
 
+# ultra: только Flow video — Ultra-tier аккаунты/лимиты.
+VIDEO_ULTRA = os.getenv("FAST_GEN_VIDEO_ULTRA", "").strip().lower() in {"1", "true", "yes", "on"}
+
 MAX_VIDEO_STARTS_PER_HOUR = 150
 RATE_WINDOW_SECONDS = 3600
 
 RETRY_SLEEP_429 = [20, 35, 60, 90]
 
 # Ёмкостные/аккаунтные ошибки провайдера ("нет доступных аккаунтов" / "no available accounts")
-# — это НЕ блок по контенту, а занятый пул аккаунтов flower. Повторяем терпеливо и долго.
+# — это НЕ блок по контенту, а занятый пул аккаунтов провайдера. Повторяем терпеливо и долго.
 CAPACITY_ERROR_MARKERS = (
     "no available account", "no accounts available", "no available accounts",
     "no free account", "all accounts", "account pool", "no account",
@@ -470,7 +472,7 @@ video_rate_limiter = HourlyRateLimiter(
 
 
 # =========================================================
-# V6 VIDEO START (flower / Veo 3.1)
+# V6 VIDEO START (flow / flow_video_from_ingredients)
 # =========================================================
 
 def build_base_payload(prompt: str) -> Dict[str, Any]:
@@ -487,7 +489,8 @@ def build_base_payload(prompt: str) -> Dict[str, Any]:
         payload["duration_seconds"] = VIDEO_DURATION_SECONDS
     if VIDEO_RESOLUTION:
         payload["resolution"] = VIDEO_RESOLUTION
-    # ВНИМАНИЕ: ultra и keyframes — только flow-video, для flower не отправляем.
+    if VIDEO_ULTRA:
+        payload["ultra"] = True
     return payload
 
 
@@ -654,7 +657,7 @@ def process_scene_item(item: SceneItem) -> None:
         append_result_log({
             "scene_index": item.scene_index,
             "status": "done",
-            "mode": "flower_video_from_image_base64",
+            "mode": "flow_video_from_ingredients_base64",
             "output": str(out_path),
             "generation_id": generation_id,
             "image": str(item.image_path),
@@ -692,7 +695,7 @@ def main() -> None:
     log(f"[INFO] Потоков: {MAX_WORKERS}")
     log(f"[INFO] Лимит: {MAX_VIDEO_STARTS_PER_HOUR} стартов видео в час")
     log(f"[INFO] Aspect ratio: {ASPECT_RATIO}")
-    log(f"[INFO] Провайдер/модель: flower / flower-video (Veo 3.1)")
+    log(f"[INFO] Провайдер/модель: flow / flow-video-fast (flow_video_from_ingredients)")
     extras = []
     if VIDEO_MODEL:
         extras.append(f"model={VIDEO_MODEL}")
@@ -702,6 +705,8 @@ def main() -> None:
         extras.append(f"duration_seconds={VIDEO_DURATION_SECONDS}")
     if VIDEO_RESOLUTION:
         extras.append(f"resolution={VIDEO_RESOLUTION}")
+    if VIDEO_ULTRA:
+        extras.append("ultra=true")
     if extras:
         log(f"[INFO] Доп. параметры: {', '.join(extras)}")
     log(f"[INFO] Режим: local image -> base64 -> POST {V6_GENERATIONS_ENDPOINT} (operation={VIDEO_OPERATION})")
