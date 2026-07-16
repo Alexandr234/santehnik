@@ -4,13 +4,14 @@ import base64
 import json
 import os
 import re
+import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -113,6 +114,19 @@ ASPECT_RATIO_RE = re.compile(r"^([1-9]\d*):([1-9]\d*)$")
 # aspect_ratio запрещён и принудительно заменяется на этот дефолт.
 DEFAULT_HORIZONTAL_ASPECT_RATIO = "16:9"
 
+# Добавка к промпту, усиливающая горизонтальную (ландшафтную) композицию.
+# Нужна потому, что модель может игнорировать поле aspect_ratio и решать
+# ориентацию по содержанию промпта.
+HORIZONTAL_PROMPT_SUFFIX = (
+    "horizontal landscape composition, wide cinematic framing, image wider than tall, "
+    "16:9 aspect ratio, full scene visible left to right, "
+    "not vertical, not portrait orientation, not a tall image"
+)
+
+# Если True — сохранять картинку, даже если её не удалось получить горизонтальной
+# (по умолчанию False: вертикаль сохранять запрещено, сцена помечается ошибкой).
+ALLOW_SAVE_VERTICAL = os.getenv("FAST_GEN_ALLOW_VERTICAL", "").strip().lower() in ("1", "true", "yes")
+
 # HTTP-коды, при которых повтор бессмыслен (ошибка запроса/валидации).
 FATAL_HTTP_CODES = {400, 401, 403, 404, 422}
 
@@ -149,6 +163,12 @@ class FatalApiError(RuntimeError):
 STATE_LOCK = Lock()
 _alias_locks_guard = Lock()
 _alias_locks: Dict[str, Lock] = {}
+
+# Модель может по-разному трактовать aspect_ratio (иногда как height:width),
+# поэтому рабочее значение, дающее ГОРИЗОНТАЛЬНЫЙ результат, определяем на лету
+# по первой удачной генерации и переиспользуем, чтобы не тратить лишние запросы.
+_HORIZONTAL_RATIO_LOCK = Lock()
+_LEARNED_HORIZONTAL_RATIO: Optional[str] = None
 
 
 def _alias_lock(alias: str) -> Lock:
@@ -303,6 +323,71 @@ def decode_data_uri_to_bytes(data_uri: str) -> bytes:
     return base64.b64decode(b64)
 
 
+def image_dimensions(data: bytes) -> Optional[Tuple[int, int]]:
+    """
+    Возвращает (width, height) картинки, читая заголовок PNG/JPEG/WEBP без сторонних
+    библиотек. None — если формат не распознан (тогда ориентацию не проверяем).
+    """
+    # PNG: сигнатура + IHDR(width,height) на фиксированном смещении.
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        w, h = struct.unpack(">II", data[16:24])
+        return int(w), int(h)
+
+    # JPEG: ищем маркер SOF, в нём height, width.
+    if data[:2] == b"\xff\xd8":
+        i, n = 2, len(data)
+        while i + 9 < n:
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                          0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                h, w = struct.unpack(">HH", data[i + 5:i + 9])
+                return int(w), int(h)
+            if marker == 0xD8 or marker == 0xD9 or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            seg_len = struct.unpack(">H", data[i + 2:i + 4])[0]
+            i += 2 + seg_len
+        return None
+
+    # WEBP (VP8/VP8L/VP8X) — на всякий случай.
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP" and len(data) >= 30:
+        chunk = data[12:16]
+        try:
+            if chunk == b"VP8 ":
+                w = struct.unpack("<H", data[26:28])[0] & 0x3FFF
+                h = struct.unpack("<H", data[28:30])[0] & 0x3FFF
+                return int(w), int(h)
+            if chunk == b"VP8L":
+                b = data[21:25]
+                bits = b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)
+                w = (bits & 0x3FFF) + 1
+                h = ((bits >> 14) & 0x3FFF) + 1
+                return int(w), int(h)
+            if chunk == b"VP8X":
+                w = 1 + (data[24] | (data[25] << 8) | (data[26] << 16))
+                h = 1 + (data[27] | (data[28] << 8) | (data[29] << 16))
+                return int(w), int(h)
+        except Exception:
+            return None
+    return None
+
+
+def is_horizontal_image(data: bytes) -> bool:
+    """
+    True, если картинка горизонтальная (ширина > высоты) ИЛИ формат нераспознан
+    (тогда не блокируем). Вертикаль и квадрат считаем НЕ горизонтальными.
+    """
+    dims = image_dimensions(data)
+    if dims is None:
+        log("[WARN] Не удалось определить размеры картинки — пропускаю проверку ориентации.")
+        return True
+    w, h = dims
+    return w > h
+
+
 def normalize_storage_id(value: str) -> str:
     """
     V6 inputs используют сырой 32-символьный storage id без префикса.
@@ -357,6 +442,21 @@ def validate_aspect_ratio(aspect_ratio: str) -> str:
         return DEFAULT_HORIZONTAL_ASPECT_RATIO
 
     return aspect_ratio
+
+
+def swap_aspect_ratio(aspect_ratio: str) -> str:
+    """Меняет местами части n:m -> m:n (для перебора трактовки aspect_ratio моделью)."""
+    m = ASPECT_RATIO_RE.match(aspect_ratio)
+    if not m:
+        return aspect_ratio
+    return f"{m.group(2)}:{m.group(1)}"
+
+
+def with_horizontal_hint(prompt: str) -> str:
+    """Добавляет к промпту подсказку про горизонтальную композицию (если её ещё нет)."""
+    if HORIZONTAL_PROMPT_SUFFIX in prompt:
+        return prompt
+    return f"{prompt}. {HORIZONTAL_PROMPT_SUFFIX}"
 
 
 def upload_file_to_storage(image_path: Path) -> str:
@@ -508,25 +608,28 @@ def download_url_to_bytes(url: str) -> bytes:
     raise RuntimeError(f"Скачивание результата провалилось после {RETRY_COUNT} попыток: {last_err}")
 
 
-def save_result_item_to_file(result_item: Dict[str, Any], path: Path) -> None:
+def result_item_to_bytes(result_item: Dict[str, Any]) -> bytes:
     """
-    Сохраняет GenerationResultItem в path.
+    Достаёт байты картинки из GenerationResultItem.
     Приоритет источников: inline data URI -> download_url.
-    (type/mime_type учитываются для диагностики; пути у нас фиксированы как .png.)
     """
     item_type = result_item.get("type")
     if item_type not in (None, "image"):
-        log(f"[WARN] Ожидали image, а результат type={item_type!r} — сохраняю как есть в {path.name}")
+        log(f"[WARN] Ожидали image, а результат type={item_type!r} — беру как есть")
 
     inline = result_item.get("data")
     if isinstance(inline, str) and inline.startswith("data:"):
-        path.write_bytes(decode_data_uri_to_bytes(inline))
-    else:
-        download_url = result_item.get("download_url")
-        if not (isinstance(download_url, str) and download_url):
-            raise RuntimeError(f"Result item без data и download_url: {result_item}")
-        path.write_bytes(download_url_to_bytes(download_url))
+        return decode_data_uri_to_bytes(inline)
 
+    download_url = result_item.get("download_url")
+    if not (isinstance(download_url, str) and download_url):
+        raise RuntimeError(f"Result item без data и download_url: {result_item}")
+    return download_url_to_bytes(download_url)
+
+
+def save_image_bytes_to_file(data: bytes, path: Path) -> None:
+    """Пишет байты картинки в path и проверяет, что файл не пустой."""
+    path.write_bytes(data)
     if not path.exists() or path.stat().st_size == 0:
         raise RuntimeError(f"Файл не сохранился или пустой: {path}")
 
@@ -570,19 +673,30 @@ def generate_image_flower(
     aspect_ratio: str,
     references: Optional[List[CharacterRef]] = None,
     state: Optional[dict] = None,
-) -> Dict[str, Any]:
+) -> bytes:
     """
-    Генерация картинки через Flower.
+    Генерация ГОРИЗОНТАЛЬНОЙ картинки через Flower.
 
     Без референса — operation flower_image_generate (текст->картинка).
     С референсом — operation flower_image_edit (img2img). Референсы уходят в inputs[]
     как именованные V6NamedMediaInput, а промпт ссылается на них по filename.
     Число референсов ограничено FLOWER_MAX_REFERENCES (Flower стабильно работает с одним).
 
+    Гарантия горизонтальной ориентации:
+      • промпт усиливается подсказкой про ландшафтную композицию;
+      • после генерации проверяются реальные размеры картинки;
+      • если модель проигнорировала aspect_ratio и вернула вертикаль — пробуем
+        перевёрнутое значение (модель может трактовать aspect_ratio как height:width);
+      • рабочее значение запоминается и переиспользуется, чтобы не тратить запросы;
+      • если горизонталь получить не удалось — вертикаль НЕ сохраняется (RuntimeError),
+        кроме случая FAST_GEN_ALLOW_VERTICAL=1.
+
     Storage id референсов имеют TTL: если API вернул "file_not_found_or_expired",
     перезагружаем файлы персонажей из локальных копий (через state) и повторяем.
-    Возвращает GenerationResultItem (dict) после ожидания завершения.
+    Возвращает байты картинки после ожидания завершения и проверки ориентации.
     """
+    global _LEARNED_HORIZONTAL_RATIO
+
     url = clean_base_url(BASE_URL) + V6_GENERATIONS_ENDPOINT
 
     refs = list(references or [])
@@ -593,43 +707,75 @@ def generate_image_flower(
         )
         refs = refs[:FLOWER_MAX_REFERENCES]
 
-    def build_payload() -> Dict[str, Any]:
+    def build_payload(ar_value: str) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "operation": OP_IMAGE_GENERATE,
-            "prompt": prompt,
-            "aspect_ratio": validate_aspect_ratio(aspect_ratio),
+            "prompt": with_horizontal_hint(prompt),
+            "aspect_ratio": ar_value,
         }
         if GENERATION_SEED is not None:
             payload["seed"] = GENERATION_SEED
         if refs:
             payload["operation"] = OP_IMAGE_EDIT
-            payload["prompt"] = compose_scene_prompt_with_refs(prompt, refs)
+            payload["prompt"] = with_horizontal_hint(compose_scene_prompt_with_refs(prompt, refs))
             payload["inputs"] = [named_media_input(r.storage_id, r.filename) for r in refs]
         return payload
 
-    # 1 обычная попытка + 1 после обновления протухших референсов.
-    for attempt in range(2):
-        try:
-            data = request_with_retries(url, build_payload())
-            generation_id = data.get("id")
-            if not generation_id:
-                raise RuntimeError(f"Flower image API не вернул generation id: {data}")
-            return poll_generation(generation_id)
-        except (FatalApiError, RuntimeError) as e:
-            can_refresh = refs and state is not None and attempt == 0 and is_expired_reference_error(e)
-            if not can_refresh:
-                raise
-            log("[INFO] Референс(ы) протухли в storage — перезагружаю из локальных файлов и повторяю.")
-            refreshed = False
-            for r in refs:
-                new_id = refresh_alias_storage_id(r.alias, state, r.storage_id)
-                if new_id and new_id != normalize_storage_id(r.storage_id):
-                    r.storage_id = new_id
-                    refreshed = True
-            if not refreshed:
-                raise
+    def generate_once(ar_value: str) -> bytes:
+        """Одна генерация с заданным aspect_ratio (+1 повтор после протухших референсов)."""
+        for attempt in range(2):
+            try:
+                data = request_with_retries(url, build_payload(ar_value))
+                generation_id = data.get("id")
+                if not generation_id:
+                    raise RuntimeError(f"Flower image API не вернул generation id: {data}")
+                return result_item_to_bytes(poll_generation(generation_id))
+            except (FatalApiError, RuntimeError) as e:
+                can_refresh = refs and state is not None and attempt == 0 and is_expired_reference_error(e)
+                if not can_refresh:
+                    raise
+                log("[INFO] Референс(ы) протухли в storage — перезагружаю из локальных файлов и повторяю.")
+                refreshed = False
+                for r in refs:
+                    new_id = refresh_alias_storage_id(r.alias, state, r.storage_id)
+                    if new_id and new_id != normalize_storage_id(r.storage_id):
+                        r.storage_id = new_id
+                        refreshed = True
+                if not refreshed:
+                    raise
+        raise RuntimeError("generate_once: исчерпаны попытки после обновления референсов")
 
-    raise RuntimeError("generate_image_flower: исчерпаны попытки после обновления референсов")
+    # Кандидаты aspect_ratio для получения горизонтали.
+    # Если рабочее значение уже выяснено в этом прогоне — используем только его.
+    horizontal_ar = validate_aspect_ratio(aspect_ratio)   # напр. 16:9
+    with _HORIZONTAL_RATIO_LOCK:
+        learned = _LEARNED_HORIZONTAL_RATIO
+    if learned:
+        candidates = [learned]
+    else:
+        swapped = swap_aspect_ratio(horizontal_ar)         # напр. 9:16
+        candidates = [horizontal_ar] + ([swapped] if swapped != horizontal_ar else [])
+
+    last_bytes: Optional[bytes] = None
+    for ar_value in candidates:
+        data_bytes = generate_once(ar_value)
+        last_bytes = data_bytes
+        if is_horizontal_image(data_bytes):
+            with _HORIZONTAL_RATIO_LOCK:
+                if _LEARNED_HORIZONTAL_RATIO != ar_value:
+                    _LEARNED_HORIZONTAL_RATIO = ar_value
+                    log(f"[INFO] Горизонтальный результат при aspect_ratio={ar_value!r} — запоминаю это значение.")
+            return data_bytes
+        log(f"[WARN] Результат получился вертикальным при aspect_ratio={ar_value!r} — пробую другое значение.")
+
+    if ALLOW_SAVE_VERTICAL and last_bytes is not None:
+        log("[WARN] FAST_GEN_ALLOW_VERTICAL=1 — сохраняю вертикальную картинку, хотя горизонталь получить не удалось.")
+        return last_bytes
+
+    raise RuntimeError(
+        "Не удалось получить горизонтальную картинку: модель вернула вертикаль для всех "
+        "вариантов aspect_ratio. Вертикаль не сохраняю (FAST_GEN_ALLOW_VERTICAL=1 снимет запрет)."
+    )
 
 
 def scene_output_path(index: int) -> Path:
@@ -679,8 +825,8 @@ def build_character_refs(prompts: List[PromptLine], state: dict) -> dict:
 
         portrait_prompt = character_portrait_prompt(alias, pline.body)
         log(f"[CHAR] Генерирую персонажа {alias} из строки {pline.index}")
-        result_item = generate_image_flower(portrait_prompt, CHARACTER_ASPECT_RATIO)
-        save_result_item_to_file(result_item, out_path)
+        image_bytes = generate_image_flower(portrait_prompt, CHARACTER_ASPECT_RATIO)
+        save_image_bytes_to_file(image_bytes, out_path)
 
         # Референс грузим как отдельный файл в storage (TTL ~1 час с последнего
         # использования). Storage id самого результата НЕ переиспользуем как референс:
@@ -734,14 +880,14 @@ def generate_one_scene(p: PromptLine, state: dict) -> dict:
     try:
         if refs:
             log(f"[SCENE] {p.index}: flower + ref через {', '.join(p.aliases[:3])}")
-            result_item = generate_image_flower(clean_prompt, SCENE_ASPECT_RATIO, refs, state)
+            image_bytes = generate_image_flower(clean_prompt, SCENE_ASPECT_RATIO, refs, state)
             mode = "flower_with_ref"
         else:
             log(f"[SCENE] {p.index}: flower без ref")
-            result_item = generate_image_flower(clean_prompt, SCENE_ASPECT_RATIO)
+            image_bytes = generate_image_flower(clean_prompt, SCENE_ASPECT_RATIO)
             mode = "flower_from_text"
 
-        save_result_item_to_file(result_item, out_path)
+        save_image_bytes_to_file(image_bytes, out_path)
         return {
             "line": p.index,
             "output": str(out_path),
