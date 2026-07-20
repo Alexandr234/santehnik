@@ -46,7 +46,9 @@ FAST visuals generator для media_gen_api V6 (image из текста -> video
    source ~/.zshrc
 
 Полезные настройки:
-   export FAST_GEN_MAX_ATTEMPTS="4"          # сколько раз пробовать при ВРЕМЕННЫХ ошибках
+   export FAST_GEN_MAX_ATTEMPTS="4"          # сколько раз пробовать при ВРЕМЕННЫХ ошибках (сеть/5xx)
+   export FAST_GEN_WAIT_ON_RATE_LIMIT="1"    # 429/часовой лимит: ждать и повторять БЕСКОНЕЧНО (по умолч. вкл)
+   export FAST_GEN_RATE_LIMIT_WAIT_SEC="60"  # пауза между повторами при 429, если нет Retry-After
    export FAST_GEN_ANIMATE_FIRST_N="2"
    export FAST_GEN_IMAGE_WORKERS="4"
    export FAST_GEN_VIDEO_WORKERS="1"
@@ -108,9 +110,17 @@ OPERATION_POLL_SEC = int(os.getenv("FAST_GEN_OPERATION_POLL_SEC", "10"))
 RETRY_DELAY_SEC = int(os.getenv("FAST_GEN_RETRY_DELAY_SEC", "8"))
 SKIP_EXISTING = True
 
-# Сколько раз пробовать при ВРЕМЕННЫХ ошибках (сеть/429/5xx). Постоянные ошибки
+# Сколько раз пробовать при ВРЕМЕННЫХ ошибках (сеть/5xx). Постоянные ошибки
 # (safety/blocked/4xx) не повторяются вовсе.
 MAX_ATTEMPTS = max(1, int(os.getenv("FAST_GEN_MAX_ATTEMPTS", "4")))
+
+# ЧАСОВОЙ ЛИМИТ (HTTP 429) — отдельный случай. По умолчанию скрипт НЕ сдаётся, а ЖДЁТ и
+# повторяет БЕСКОНЕЧНО, пока окно лимита не сбросится (это НЕ тратит попытки MAX_ATTEMPTS).
+# Так можно оставить генерацию надолго: упёрлись в часовой лимит -> подождали -> продолжили.
+# Выключить (вернуть старое поведение «429 = обычная временная ошибка»): FAST_GEN_WAIT_ON_RATE_LIMIT=0.
+WAIT_ON_RATE_LIMIT = os.getenv("FAST_GEN_WAIT_ON_RATE_LIMIT", "1").strip().lower() not in ("0", "false", "no", "нет")
+# Пауза между повторами при 429, сек (если сервер не прислал Retry-After).
+RATE_LIMIT_WAIT_SEC = max(5, int(os.getenv("FAST_GEN_RATE_LIMIT_WAIT_SEC", "60")))
 
 SKIP_MISSING_PROMPTS = os.getenv("FAST_GEN_SKIP_MISSING_PROMPTS", "1").strip().lower() not in ("0", "false", "no", "нет")
 
@@ -164,6 +174,20 @@ PERMANENT_ERROR_MARKERS = (
     "violat",
 )
 
+# Маркеры ЛИМИТА запросов / часового лимита — их ждём (бесконечно), а не считаем обычной ошибкой.
+# На случай, если лимит приходит не как HTTP 429, а как текст ошибки в теле/статусе.
+RATE_LIMIT_MARKERS = (
+    "429",
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+    "quota",
+    "per hour",
+    "per-hour",
+    "hourly",
+    "hour limit",
+)
+
 
 # =========================
 # DATA MODELS / ERRORS
@@ -189,6 +213,12 @@ def classify_error_message(message: str) -> bool:
     """True, если сообщение похоже на ПОСТОЯННУЮ ошибку (не повторяем)."""
     low = message.lower()
     return any(marker in low for marker in PERMANENT_ERROR_MARKERS)
+
+
+def looks_like_rate_limit(message: Any) -> bool:
+    """True, если ошибка похожа на лимит запросов / часовой лимит (ждём, не сдаёмся)."""
+    low = str(message).lower()
+    return any(marker in low for marker in RATE_LIMIT_MARKERS)
 
 
 # =========================
@@ -397,11 +427,18 @@ def image_to_data_uri(image_path: Path) -> str:
 
 
 def download_url_to_bytes(url: str) -> bytes:
-    """Скачивает файл результата по download_url. Ограниченный ретрай."""
+    """Скачивает файл результата по download_url. 429 — ждём бесконечно, прочее — ограниченный ретрай."""
     last_error: Optional[Exception] = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    rate_waited = 0
+    attempts_used = 0
+    while attempts_used < MAX_ATTEMPTS:
         try:
             resp = requests.get(url, headers={"X-API-Key": API_KEY}, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 429:
+                if WAIT_ON_RATE_LIMIT:
+                    rate_waited = wait_for_rate_limit(resp, label="download result", waited=rate_waited)
+                    continue
+                raise TransientError(f"Rate limit 429: {resp.text[:200]}")
             if 400 <= resp.status_code < 500:
                 raise PermanentError(f"HTTP {resp.status_code}: {resp.text[:200]}")
             if resp.status_code >= 500:
@@ -414,9 +451,13 @@ def download_url_to_bytes(url: str) -> bytes:
         except KeyboardInterrupt:
             raise
         except Exception as e:
+            if WAIT_ON_RATE_LIMIT and looks_like_rate_limit(e):
+                rate_waited = wait_for_rate_limit(None, label="download result", waited=rate_waited)
+                continue
+            attempts_used += 1
             last_error = e
-            log(f"[WARN] download result попытка {attempt}/{MAX_ATTEMPTS} не удалась: {e}")
-            if attempt < MAX_ATTEMPTS:
+            log(f"[WARN] download result попытка {attempts_used}/{MAX_ATTEMPTS} не удалась: {e}")
+            if attempts_used < MAX_ATTEMPTS:
                 time.sleep(RETRY_DELAY_SEC)
     raise TransientError(f"Не удалось скачать результат за {MAX_ATTEMPTS} попыток: {last_error}")
 
@@ -441,13 +482,38 @@ def save_result_item_to_file(result_item: Dict[str, Any], path: Path) -> None:
 # HTTP HELPERS
 # =========================
 
+def wait_for_rate_limit(resp: Optional[requests.Response], *, label: str, waited: int) -> int:
+    """Пауза при 429 / часовом лимите. Возвращает суммарное время ожидания.
+
+    ВАЖНО: эта пауза НЕ тратит попытки MAX_ATTEMPTS — вызывающие циклы повторяют
+    запрос БЕСКОНЕЧНО, пока окно часового лимита не сбросится. Прервать — Ctrl+C.
+    """
+    delay = RATE_LIMIT_WAIT_SEC
+    if resp is not None:
+        retry_after = resp.headers.get("Retry-After")
+        if retry_after and str(retry_after).strip().isdigit():
+            delay = max(5, int(str(retry_after).strip()))
+    total = waited + delay
+    mins = total // 60
+    extra = f" ≈ {mins} мин" if mins else ""
+    log(f"[RATE-LIMIT] {label}: похоже, исчерпан часовой лимит (429). "
+        f"Жду {delay}s и повторяю без ограничения по попыткам (в ожидании уже ~{total}s{extra})...")
+    time.sleep(delay)
+    return total
+
+
 def request_with_retries_post(url: str, payload: dict, *, label: str) -> dict:
-    """POST c ограниченным ретраем. 4xx (кроме 429) — постоянная ошибка, не повторяем."""
+    """POST c ретраем. 429/часовой лимит — ждём бесконечно; 4xx — постоянная ошибка, не повторяем."""
     last_error: Optional[Exception] = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    rate_waited = 0
+    attempts_used = 0
+    while attempts_used < MAX_ATTEMPTS:
         try:
             resp = requests.post(url, headers=headers(), json=payload, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 429:
+                if WAIT_ON_RATE_LIMIT:
+                    rate_waited = wait_for_rate_limit(resp, label=label, waited=rate_waited)
+                    continue  # не тратим попытку — ждём сброса лимита
                 raise TransientError(f"Rate limit 429: {resp.text[:300]}")
             if 400 <= resp.status_code < 500:
                 raise PermanentError(f"HTTP {resp.status_code}: {resp.text[:300]}")
@@ -459,20 +525,29 @@ def request_with_retries_post(url: str, payload: dict, *, label: str) -> dict:
         except KeyboardInterrupt:
             raise
         except Exception as e:
+            if WAIT_ON_RATE_LIMIT and looks_like_rate_limit(e):
+                rate_waited = wait_for_rate_limit(None, label=label, waited=rate_waited)
+                continue  # лимит пришёл текстом ошибки — тоже ждём, не тратим попытку
+            attempts_used += 1
             last_error = e
-            log(f"[WARN] {label}: попытка {attempt}/{MAX_ATTEMPTS} не удалась: {e}")
-            if attempt < MAX_ATTEMPTS:
+            log(f"[WARN] {label}: попытка {attempts_used}/{MAX_ATTEMPTS} не удалась: {e}")
+            if attempts_used < MAX_ATTEMPTS:
                 time.sleep(RETRY_DELAY_SEC)
     raise TransientError(f"{label}: не удалось за {MAX_ATTEMPTS} попыток: {last_error}")
 
 
 def request_get_with_retries(url: str, *, label: str, params: Optional[dict] = None) -> dict:
-    """GET c ограниченным ретраем. 4xx (кроме 429) — постоянная ошибка, не повторяем."""
+    """GET c ретраем. 429/часовой лимит — ждём бесконечно; 4xx — постоянная ошибка, не повторяем."""
     last_error: Optional[Exception] = None
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    rate_waited = 0
+    attempts_used = 0
+    while attempts_used < MAX_ATTEMPTS:
         try:
             resp = requests.get(url, headers={"X-API-Key": API_KEY}, params=params, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 429:
+                if WAIT_ON_RATE_LIMIT:
+                    rate_waited = wait_for_rate_limit(resp, label=label, waited=rate_waited)
+                    continue
                 raise TransientError(f"Rate limit 429: {resp.text[:300]}")
             if 400 <= resp.status_code < 500:
                 raise PermanentError(f"HTTP {resp.status_code}: {resp.text[:300]}")
@@ -484,9 +559,13 @@ def request_get_with_retries(url: str, *, label: str, params: Optional[dict] = N
         except KeyboardInterrupt:
             raise
         except Exception as e:
+            if WAIT_ON_RATE_LIMIT and looks_like_rate_limit(e):
+                rate_waited = wait_for_rate_limit(None, label=label, waited=rate_waited)
+                continue
+            attempts_used += 1
             last_error = e
-            log(f"[WARN] {label}: GET попытка {attempt}/{MAX_ATTEMPTS} не удалась: {e}")
-            if attempt < MAX_ATTEMPTS:
+            log(f"[WARN] {label}: GET попытка {attempts_used}/{MAX_ATTEMPTS} не удалась: {e}")
+            if attempts_used < MAX_ATTEMPTS:
                 time.sleep(RETRY_DELAY_SEC)
     raise TransientError(f"{label}: не удалось за {MAX_ATTEMPTS} попыток: {last_error}")
 
@@ -922,7 +1001,11 @@ def main() -> None:
         log(f"Video model: {VIDEO_MODEL}")
     log("Start image: inline base64 data URI в inputs[] (без storage upload)")
     log(f"Aspect ratio: image={IMAGE_ASPECT_RATIO}, video={VIDEO_ASPECT_RATIO}")
-    log(f"Max attempts (временные ошибки): {MAX_ATTEMPTS}; safety-блок НЕ повторяется")
+    log(f"Max attempts (сеть/5xx): {MAX_ATTEMPTS}; safety-блок НЕ повторяется")
+    if WAIT_ON_RATE_LIMIT:
+        log(f"Часовой лимит (429): ЖДУ и повторяю БЕСКОНЕЧНО (пауза {RATE_LIMIT_WAIT_SEC}s или Retry-After)")
+    else:
+        log("Часовой лимит (429): выключено ожидание — считается обычной временной ошибкой")
     log(f"Speed: image_workers={MAX_IMAGE_WORKERS}, video_workers={MAX_VIDEO_WORKERS}, locale_workers={MAX_LOCALE_WORKERS}")
 
     prompts_by_locale = load_prompts_by_locale()
