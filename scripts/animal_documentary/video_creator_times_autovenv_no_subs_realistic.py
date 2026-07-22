@@ -9,10 +9,21 @@
 #       002 | 00:00:06,640 --> 00:00:08,840 | duration: 2.20s | type: broll
 #    type: speech — фраза диктора; src говорит, откуда вырезать эту фразу из ИСХОДНОЙ озвучки.
 #    type: broll  — пауза-перебивка: на экране кадры животных, диктор МОЛЧИТ.
-#    Скрипт сам режет озвучку по фразам и вставляет тишину на время перебивок,
+#    Скрипт сам режет озвучку и вставляет тишину на время перебивок,
 #    так что финальный звук диктора точно совпадает с растянутой шкалой.
 #    Старый формат (без type/src) полностью поддерживается: всё считается speech,
 #    озвучка идёт сплошным куском, как раньше.
+#
+#    ВАЖНО (исправление разрезанных слов и потерянных секунд):
+#    озвучка НЕ режется по таймкодам Whisper — они неточные и могут попасть
+#    в середину слова («обезь…яна»). Вместо этого:
+#      - разрезы делаются ТОЛЬКО там, где вставляется пауза-перебивка;
+#      - точное место разреза ищется по РЕАЛЬНОЙ ТИШИНЕ в озвучке
+#        (ffmpeg silencedetect) рядом с границей фраз;
+#      - между фразами без паузы озвучка вообще не режется — все естественные
+#        микропаузы дыхания сохраняются, ни одна секунда звука не теряется;
+#      - длительности видеосегментов подгоняются под фактические куски озвучки,
+#        поэтому картинка и голос не расходятся.
 #
 # 2) ЖИВОЙ ЗВУК ПРИРОДЫ ИЗ КЛИПОВ.
 #    Раньше звук исходных видео выбрасывался. Теперь родной звук каждого клипа
@@ -68,6 +79,7 @@ _restart_inside_venv_if_needed()
 del _restart_inside_venv_if_needed
 
 import csv
+import json
 import math
 import os
 import re
@@ -127,6 +139,15 @@ TIMING_FILE_BY_FOLDER = {
     "ES": PROMPTS_DIR / "image_times_es.txt",
 }
 
+# Точный план монтажа от analyze_voiceover_cutplan.py (если есть — используется он,
+# иначе сборщик сам анализирует озвучку по тишине).
+CUTPLAN_FILE_BY_FOLDER = {
+    "RU": PROMPTS_DIR / "cutplan_ru.json",
+    "GE": PROMPTS_DIR / "cutplan_de.json",
+    "PL": PROMPTS_DIR / "cutplan_pl.json",
+    "ES": PROMPTS_DIR / "cutplan_es.json",
+}
+
 # Видео параметры.
 TARGET_WIDTH = 1920
 TARGET_HEIGHT = 1080
@@ -162,6 +183,13 @@ DUCK_RATIO = 10               # насколько сильно приглуша
 DUCK_ATTACK_MS = 150          # как быстро приглушается, мс
 DUCK_RELEASE_MS = 700         # как быстро возвращается после фразы, мс
 AUDIO_SAMPLE_RATE = 48000
+
+# --- ПОИСК ТИШИНЫ ДЛЯ РАЗРЕЗОВ ОЗВУЧКИ ---
+# Разрез под паузу-перебивку делается в ближайшей реальной тишине, а не по таймкоду
+# Whisper, чтобы никогда не резать слово пополам.
+SILENCE_NOISE_DB = -35.0      # что считать тишиной (дБ); для шумных озвучек попробуй -30
+SILENCE_MIN_DUR = 0.12        # минимальная длительность тишины, сек
+CUT_SEARCH_WINDOW = 0.7       # насколько далеко (сек) от границы фраз можно искать тишину
 
 # Субтитры отключены. Скрипт не запускает Whisper и не вшивает SRT.
 
@@ -416,7 +444,13 @@ def resolve_image_path(visual_dir: Path, raw_name: str, images_by_name: dict[str
     return None
 
 
-def collect_segments_for_language(lang: str, visual_dir: Path, audio_duration: float, timings: list[TimingEntry]) -> list[Segment]:
+def collect_segments_for_language(
+    lang: str,
+    visual_dir: Path,
+    audio_duration: float,
+    timings: list[TimingEntry],
+    entry_durations: Optional[list[float]] = None,
+) -> list[Segment]:
     """
     Собирает визуальную дорожку по таймингам из image_times_*.txt.
 
@@ -451,22 +485,12 @@ def collect_segments_for_language(lang: str, visual_dir: Path, audio_duration: f
 
     segments: list[Segment] = []
     for i, ((kind, path), timing) in enumerate(zip(selected_paths, timings)):
-        duration = timing.duration
+        # Плановая длительность из выравнивания по озвучке (включает естественные
+        # микропаузы дыхания); фолбэк — номинальная длительность из файла таймингов.
+        duration = entry_durations[i] if entry_durations else timing.duration
         if i < len(selected_paths) - 1 and TRANSITION_DURATION > 0:
             duration += TRANSITION_DURATION
         segments.append(Segment(kind=kind, path=path, duration=duration))
-
-    # Сверяем длину озвучки с суммарной длительностью РЕЧЕВЫХ интервалов
-    # (паузы-перебивки в озвучке отсутствуют — на их месте будет тишина).
-    speech_total = sum(
-        (t.src_end - t.src_start) if (t.src_start is not None and t.src_end is not None) else t.duration
-        for t in timings if t.kind == "speech"
-    )
-    if abs(audio_duration - speech_total) > 1.5:
-        log(
-            f"⚠️ Длина озвучки ({audio_duration:.2f} сек.) отличается от суммы речевых интервалов "
-            f"({speech_total:.2f} сек.). Проверь, что тайминги сделаны из этой озвучки."
-        )
 
     return segments
 
@@ -746,48 +770,215 @@ def run_ffmpeg(cmd: list[str], what: str) -> None:
         raise RuntimeError(f"FFmpeg ошибка ({what}):\n{result.stderr}")
 
 
-def build_voiceover_with_pauses(audio_path: Path, timings: list[TimingEntry], out_wav: Path) -> None:
+def detect_silences(audio_path: Path, audio_duration: float) -> list[tuple[float, float]]:
+    """Возвращает интервалы реальной тишины в озвучке (по ffmpeg silencedetect)."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostats",
+        "-i", str(audio_path),
+        "-af", f"silencedetect=noise={SILENCE_NOISE_DB}dB:d={SILENCE_MIN_DUR}",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    text = result.stderr or ""
+    silences: list[tuple[float, float]] = []
+    pending: Optional[float] = None
+    for m in re.finditer(r"silence_(start|end):\s*([0-9.]+)", text):
+        kind, value = m.group(1), float(m.group(2))
+        if kind == "start":
+            pending = value
+        elif pending is not None:
+            silences.append((pending, value))
+            pending = None
+    if pending is not None:
+        silences.append((pending, audio_duration))
+    return silences
+
+
+def choose_cut_point(
+    gap_lo: float,
+    gap_hi: float,
+    silences: list[tuple[float, float]],
+    prev_cut: float,
+) -> tuple[float, bool]:
+    """Ищет безопасную точку разреза озвучки возле границы фраз [gap_lo..gap_hi].
+
+    Точка обязана лежать ВНУТРИ реальной тишины (иначе можно разрезать слово,
+    т.к. таймкоды Whisper неточные). Возвращает (точка, нашлась ли тишина).
+    Если тишины рядом нет — фолбэк на середину номинального зазора.
     """
-    Собирает дорожку ДИКТОРА по финальной шкале ролика:
-      - для каждой строки type: speech вырезается кусок исходной озвучки (диапазон src);
-      - для каждой строки type: broll вставляется тишина такой же длины (пауза-перебивка);
-      - всё склеивается по порядку — голос точно совпадает с растянутой шкалой видео.
-    Если пауз нет и src совпадает с основной шкалой (старый формат) —
-    озвучка просто конвертируется в wav сплошным куском, как раньше.
+    nominal = (gap_lo + gap_hi) / 2.0
+    window_lo = gap_lo - CUT_SEARCH_WINDOW
+    window_hi = gap_hi + CUT_SEARCH_WINDOW
+
+    best: Optional[float] = None
+    best_dist: float = 0.0
+    for s, e in silences:
+        if e < window_lo or s > window_hi:
+            continue
+        # Середина пересечения тишины с окном поиска; точка остаётся внутри тишины.
+        lo = max(s, window_lo)
+        hi = min(e, window_hi)
+        if hi <= lo:
+            continue
+        point = (lo + hi) / 2.0
+        dist = abs(point - nominal)
+        if best is None or dist < best_dist:
+            best, best_dist = point, dist
+
+    if best is not None:
+        return max(best, prev_cut + 0.05), True
+    return max(nominal, prev_cut + 0.05), False
+
+
+def plan_voice_alignment(
+    timings: list[TimingEntry],
+    audio_duration: float,
+    silences: list[tuple[float, float]],
+) -> tuple[list[float], list[tuple]]:
+    """Выравнивает шкалу по РЕАЛЬНОЙ озвучке. Ничего из озвучки не выбрасывается.
+
+    Принципы:
+      - озвучка режется ТОЛЬКО в местах пауз-перебивок, и только по реальной тишине;
+      - подряд идущие фразы без паузы остаются ОДНИМ непрерывным куском звука
+        (все естественные микропаузы дыхания сохраняются);
+      - первая фраза начинается с 0.0, последняя заканчивается концом озвучки;
+      - длительность каждого видеосегмента подгоняется под фактический кусок звука.
+
+    Возвращает:
+      entry_durations — плановая длительность каждой позиции таймлайна (по порядку);
+      sequence        — план склейки голоса: ('audio', from, to) | ('silence', dur).
     """
-    has_pauses = any(t.kind == "broll" for t in timings)
-    shifted = any(
-        t.kind == "speech" and t.src_start is not None and abs(t.src_start - t.start) > 0.01
+    # Группируем подряд идущие записи одного типа: speech-раны и broll-группы.
+    groups: list[tuple[str, list[TimingEntry]]] = []
+    for t in timings:
+        if groups and groups[-1][0] == t.kind:
+            groups[-1][1].append(t)
+        else:
+            groups.append((t.kind, [t]))
+
+    speech_groups = [g[1] for g in groups if g[0] == "speech"]
+    if not speech_groups:
+        raise ValueError("В таймингах нет ни одной речевой позиции.")
+
+    # Точки разреза озвучки между соседними speech-ранами (там, где стоят паузы).
+    cuts: list[float] = []
+    prev_cut = 0.0
+    snapped_count = 0
+    for gi in range(len(speech_groups) - 1):
+        a = speech_groups[gi][-1]       # последняя фраза рана
+        b = speech_groups[gi + 1][0]    # первая фраза следующего рана
+        gap_lo = a.src_end if a.src_end is not None else a.end
+        gap_hi = b.src_start if b.src_start is not None else b.start
+        if gap_hi < gap_lo:
+            gap_lo, gap_hi = gap_hi, gap_lo
+        cut, snapped = choose_cut_point(gap_lo, gap_hi, silences, prev_cut)
+        cut = min(cut, max(prev_cut + 0.05, audio_duration - 0.05))
+        cuts.append(cut)
+        prev_cut = cut
+        if snapped:
+            snapped_count += 1
+        else:
+            log(f"    ⚠️ разрез #{gi + 1} у {cut:.2f}s: тишина рядом не найдена, "
+                f"режу в середине зазора фраз (попробуй SILENCE_NOISE_DB=-30, если слышен обрыв)")
+    if cuts:
+        log(f"Разрезы озвучки: {len(cuts)}, из них по реальной тишине: {snapped_count}")
+
+    # Диапазон озвучки каждого speech-рана: от предыдущего разреза до следующего.
+    ranges: list[tuple[float, float]] = []
+    for gi in range(len(speech_groups)):
+        start = 0.0 if gi == 0 else cuts[gi - 1]
+        end = audio_duration if gi == len(speech_groups) - 1 else cuts[gi]
+        ranges.append((start, end))
+
+    # Плановые длительности позиций: внутри рана границы сегментов идут по src_start
+    # следующих фраз (сдвиг картинки может попасть на слово — для ВИДЕО это нормально),
+    # а весь ран целиком точно равен своему куску озвучки.
+    entry_durations: list[float] = [0.0] * len(timings)
+    pos_of = {id(t): i for i, t in enumerate(timings)}
+
+    for ents, (run_start, run_end) in zip(speech_groups, ranges):
+        bounds = [run_start]
+        for e in ents[1:]:
+            bounds.append(e.src_start if e.src_start is not None else e.start)
+        bounds.append(run_end)
+        for i in range(1, len(bounds)):
+            bounds[i] = max(bounds[i], bounds[i - 1] + 0.05)
+        for e, seg_start, seg_end in zip(ents, bounds, bounds[1:]):
+            entry_durations[pos_of[id(e)]] = seg_end - seg_start
+
+    for t in timings:
+        if t.kind == "broll":
+            entry_durations[pos_of[id(t)]] = t.duration
+
+    # План склейки голоса: audio-раны и тишина пауз в порядке таймлайна.
+    sequence: list[tuple] = []
+    run_index = 0
+    for kind, ents in groups:
+        if kind == "speech":
+            sequence.append(("audio", ranges[run_index][0], ranges[run_index][1]))
+            run_index += 1
+        else:
+            sequence.append(("silence", sum(e.duration for e in ents)))
+
+    natural_gaps = audio_duration - sum(
+        (t.src_end - t.src_start)
         for t in timings
+        if t.kind == "speech" and t.src_start is not None and t.src_end is not None
     )
+    if natural_gaps > 0.3:
+        log(f"Естественные паузы дыхания в озвучке: ~{natural_gaps:.1f}s — сохраняются полностью")
 
-    if not has_pauses and not shifted:
-        cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-i", str(audio_path),
-            "-vn", "-ac", "2", "-ar", str(AUDIO_SAMPLE_RATE),
-            "-c:a", "pcm_s16le",
-            str(out_wav),
-        ]
-        run_ffmpeg(cmd, "конвертация озвучки")
-        return
+    return entry_durations, sequence
 
+
+def load_cutplan(lang: str, timings: list[TimingEntry], audio_duration: float) -> Optional[tuple[list[float], list[tuple]]]:
+    """Читает точный план монтажа от analyze_voiceover_cutplan.py, если он есть и актуален."""
+    path = CUTPLAN_FILE_BY_FOLDER.get(lang.upper())
+    if path is None or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entries = data.get("entries", [])
+        sequence_raw = data.get("sequence", [])
+        plan_audio = float(data.get("audio_duration", 0.0))
+    except Exception as exc:
+        log(f"⚠️ Не удалось прочитать cutplan {path.name}: {exc} — анализирую озвучку сам")
+        return None
+
+    if len(entries) != len(timings):
+        log(f"⚠️ cutplan {path.name} устарел: позиций {len(entries)}, а в таймингах {len(timings)} "
+            f"— анализирую озвучку сам")
+        return None
+    if abs(plan_audio - audio_duration) > 0.5:
+        log(f"⚠️ cutplan {path.name} сделан для другой озвучки "
+            f"({plan_audio:.2f}s vs {audio_duration:.2f}s) — анализирую озвучку сам")
+        return None
+
+    durations = [float(e["duration"]) for e in entries]
+    sequence: list[tuple] = []
+    for item in sequence_raw:
+        if item[0] == "audio":
+            sequence.append(("audio", float(item[1]), float(item[2])))
+        else:
+            sequence.append(("silence", float(item[1])))
+    log(f"Использую точный план монтажа: {path.name}")
+    return durations, sequence
+
+
+def build_voiceover_from_plan(audio_path: Path, sequence: list[tuple], out_wav: Path) -> None:
+    """Склеивает дорожку диктора по плану: непрерывные куски озвучки + тишина пауз."""
     fmt = f"aresample={AUDIO_SAMPLE_RATE},aformat=sample_fmts=s16:channel_layouts=stereo"
     filter_parts: list[str] = []
     labels: list[str] = []
 
-    for k, t in enumerate(timings):
+    for k, item in enumerate(sequence):
         lab = f"p{k}"
-        if t.kind == "speech":
-            ss = max(0.0, t.src_start if t.src_start is not None else t.start)
-            se = max(ss + 0.01, t.src_end if t.src_end is not None else t.end)
-            filter_parts.append(
-                f"[0:a]atrim={ss:.3f}:{se:.3f},asetpts=PTS-STARTPTS,{fmt}[{lab}]"
-            )
+        if item[0] == "audio":
+            _tag, a, b = item
+            filter_parts.append(f"[0:a]atrim={a:.3f}:{b:.3f},asetpts=PTS-STARTPTS,{fmt}[{lab}]")
         else:
-            # Пауза-перебивка: диктор молчит, звучит только природа из ambient-дорожки.
             filter_parts.append(
-                f"aevalsrc=0:d={t.duration:.3f}:s={AUDIO_SAMPLE_RATE},"
+                f"aevalsrc=0:d={item[1]:.3f}:s={AUDIO_SAMPLE_RATE},"
                 f"aformat=sample_fmts=s16:channel_layouts=stereo[{lab}]"
             )
         labels.append(f"[{lab}]")
@@ -802,8 +993,9 @@ def build_voiceover_with_pauses(audio_path: Path, timings: list[TimingEntry], ou
         "-c:a", "pcm_s16le",
         str(out_wav),
     ]
-    log(f"Озвучка: режу на {sum(1 for t in timings if t.kind == 'speech')} фраз, "
-        f"вставляю {sum(1 for t in timings if t.kind == 'broll')} пауз")
+    audio_parts = sum(1 for item in sequence if item[0] == "audio")
+    silence_parts = len(sequence) - audio_parts
+    log(f"Озвучка: {audio_parts} непрерывных кусков голоса + {silence_parts} пауз")
     run_ffmpeg(cmd, "озвучка с паузами")
 
 
@@ -953,7 +1145,18 @@ def build_video_for_language(lang: str, audio_path: Path, visual_dir: Path) -> b
         log(f"Длительность озвучки: {audio_duration:.2f} сек.")
 
         timings = read_timing_entries(lang)
-        segments = collect_segments_for_language(lang, visual_dir, audio_duration, timings)
+
+        # Выравнивание по РЕАЛЬНОЙ озвучке: готовый cutplan от анализатора,
+        # либо собственный анализ тишины (разрезы только в тишине, звук не теряется).
+        plan = load_cutplan(lang, timings, audio_duration)
+        if plan is None:
+            silences = detect_silences(audio_path, audio_duration)
+            log(f"Найдено интервалов тишины в озвучке: {len(silences)}")
+            entry_durations, sequence = plan_voice_alignment(timings, audio_duration, silences)
+        else:
+            entry_durations, sequence = plan
+
+        segments = collect_segments_for_language(lang, visual_dir, audio_duration, timings, entry_durations)
 
         video_count = sum(1 for s in segments if s.kind == "video")
         image_count = sum(1 for s in segments if s.kind == "image")
@@ -966,9 +1169,9 @@ def build_video_for_language(lang: str, audio_path: Path, visual_dir: Path) -> b
             visual_track_path = temp_dir / f"{lang}_visual_no_audio.mp4"
             total_duration = render_visual_track(segments, visual_track_path)
 
-            # 1) Голос диктора по финальной шкале: фразы + тишина в паузах-перебивках.
+            # 1) Голос диктора по плану: непрерывные куски озвучки + тишина в паузах.
             voice_wav = temp_dir / f"{lang}_voice.wav"
-            build_voiceover_with_pauses(audio_path, timings, voice_wav)
+            build_voiceover_from_plan(audio_path, sequence, voice_wav)
 
             # 2) Природа: родной звук клипов, выровненный по видеоряду.
             ambient_wav: Optional[Path] = None
