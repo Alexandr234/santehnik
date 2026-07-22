@@ -234,8 +234,9 @@ def check_dependencies() -> None:
 
     for cmd_name in ["ffmpeg", "ffprobe"]:
         try:
-            subprocess.run([cmd_name, "-version"], capture_output=True, check=True, timeout=5)
-            print(f"{cmd_name}... ОК")
+            result = subprocess.run([cmd_name, "-version"], capture_output=True, check=True, timeout=5, text=True)
+            version_line = (result.stdout or "").splitlines()[0] if result.stdout else ""
+            print(f"{cmd_name}... ОК ({version_line})")
         except Exception:
             print(f"Критическая ошибка: {cmd_name} не найден.", file=sys.stderr)
             print("Установи FFmpeg и проверь, что ffmpeg/ffprobe доступны из терминала.", file=sys.stderr)
@@ -1030,37 +1031,96 @@ def load_cutplan(lang: str, timings: list[TimingEntry], audio_duration: float) -
 
 
 def build_voiceover_from_plan(audio_path: Path, sequence: list[tuple], out_wav: Path) -> None:
-    """Склеивает дорожку диктора по плану: непрерывные куски озвучки + тишина пауз."""
-    fmt = f"aresample={AUDIO_SAMPLE_RATE},aformat=sample_fmts=s16:channel_layouts=stereo"
-    filter_parts: list[str] = []
-    labels: list[str] = []
+    """Склеивает дорожку диктора по плану: непрерывные куски озвучки + тишина пауз.
 
-    for k, item in enumerate(sequence):
-        lab = f"p{k}"
-        if item[0] == "audio":
-            _tag, a, b = item
-            filter_parts.append(f"[0:a]atrim={a:.3f}:{b:.3f},asetpts=PTS-STARTPTS,{fmt}[{lab}]")
-        else:
-            filter_parts.append(
-                f"aevalsrc=0:d={item[1]:.3f}:s={AUDIO_SAMPLE_RATE},"
-                f"aformat=sample_fmts=s16:channel_layouts=stereo[{lab}]"
-            )
-        labels.append(f"[{lab}]")
-
-    filter_parts.append("".join(labels) + f"concat=n={len(labels)}:v=0:a=1[vout]")
-
-    cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", str(audio_path),
-        "-filter_complex", ";".join(filter_parts),
-        "-map", "[vout]",
-        "-c:a", "pcm_s16le",
-        str(out_wav),
-    ]
+    НАДЁЖНАЯ СХЕМА (исправление «звук пропадает с середины ролика»):
+    раньше все куски вырезались ОДНИМ ffmpeg-фильтром с десятками параллельных
+    ветвей от одного входа — на части сборок ffmpeg (в т.ч. 7.x на macOS) такие
+    ветви после переполнения внутренних очередей отдают пустоту, и всё после
+    первого длинного куска становилось тишиной. Теперь каждый кусок вырезается
+    ОТДЕЛЬНЫМ простым вызовом ffmpeg в свой wav, а склейка идёт через concat
+    demuxer — параллельных ветвей нет вообще, ломаться нечему.
+    """
     audio_parts = sum(1 for item in sequence if item[0] == "audio")
     silence_parts = len(sequence) - audio_parts
     log(f"Озвучка: {audio_parts} непрерывных кусков голоса + {silence_parts} пауз")
-    run_ffmpeg(cmd, "озвучка с паузами")
+
+    chunks_dir = out_wav.parent / (out_wav.stem + "_chunks")
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+
+    list_lines: list[str] = []
+    for k, item in enumerate(sequence):
+        chunk = chunks_dir / f"c{k:03d}.wav"
+        if item[0] == "audio":
+            _tag, a, b = item
+            dur = max(0.05, b - a)
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{a:.3f}",
+                "-i", str(audio_path),
+                "-t", f"{dur:.3f}",
+                "-vn", "-ac", "2", "-ar", str(AUDIO_SAMPLE_RATE),
+                "-c:a", "pcm_s16le",
+                str(chunk),
+            ]
+            run_ffmpeg(cmd, f"кусок озвучки {k} ({a:.2f}-{b:.2f}s)")
+        else:
+            dur = max(0.05, float(item[1]))
+            cmd = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=stereo",
+                "-t", f"{dur:.3f}",
+                "-c:a", "pcm_s16le",
+                str(chunk),
+            ]
+            run_ffmpeg(cmd, f"пауза {k} ({dur:.2f}s)")
+        list_lines.append(f"file '{chunk.as_posix()}'")
+
+    list_file = chunks_dir / "concat_list.txt"
+    list_file.write_text("\n".join(list_lines) + "\n", encoding="utf-8")
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "concat", "-safe", "0",
+        "-i", str(list_file),
+        "-c:a", "pcm_s16le",
+        str(out_wav),
+    ]
+    run_ffmpeg(cmd, "склейка озвучки")
+
+    # Прибираем куски.
+    try:
+        for p in chunks_dir.iterdir():
+            p.unlink(missing_ok=True)
+        chunks_dir.rmdir()
+    except Exception:
+        pass
+
+
+def verify_voice_wav(voice_wav: Path, expected_duration: float) -> None:
+    """Проверка голосовой дорожки ДО сведения: длина и отсутствие длинных провалов.
+
+    Паузы-перебивки короткие (2-4s), поэтому немой участок >12s внутри дорожки —
+    признак сломанной склейки. Ошибка видна сразу, а не после просмотра ролика.
+    """
+    actual = ffprobe_duration(voice_wav)
+    if abs(actual - expected_duration) > 1.0:
+        log(f"⚠️ ГОЛОС: длина дорожки {actual:.2f}s, ожидалось {expected_duration:.2f}s")
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostats",
+        "-i", str(voice_wav),
+        "-af", "silencedetect=noise=-60dB:d=12",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    text = result.stderr or ""
+    starts = [float(m.group(1)) for m in re.finditer(r"silence_start:\s*([0-9.]+)", text)]
+    if starts:
+        log("⚠️ ГОЛОС: найдены длинные немые участки в голосовой дорожке: "
+            + ", ".join(f"{s:.1f}s" for s in starts[:10]))
+    else:
+        log("Голосовая дорожка целая: длинных провалов нет ✅")
 
 
 def build_ambient_track(segments: list[Segment], out_wav: Path) -> bool:
@@ -1279,6 +1339,10 @@ def build_video_for_language(lang: str, audio_path: Path, visual_dir: Path) -> b
             # 1) Голос диктора по плану: непрерывные куски озвучки + тишина в паузах.
             voice_wav = temp_dir / f"{lang}_voice.wav"
             build_voiceover_from_plan(audio_path, sequence, voice_wav)
+            expected_voice = sum(
+                (it[2] - it[1]) if it[0] == "audio" else it[1] for it in sequence
+            )
+            verify_voice_wav(voice_wav, expected_voice)
 
             # 2) Природа: родной звук клипов, выровненный по видеоряду.
             ambient_wav: Optional[Path] = None
