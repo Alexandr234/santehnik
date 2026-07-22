@@ -247,6 +247,9 @@ def plan_alignment(timings: list[TimingEntry], audio_duration: float, silences: 
         if gap_hi < gap_lo:
             gap_lo, gap_hi = gap_hi, gap_lo
         cut, snapped = choose_cut_point(gap_lo, gap_hi, silences, prev_cut)
+        # Разрез не может уйти далеко от границы фраз и обязан оставаться монотонным.
+        cut = min(max(cut, gap_lo - CUT_SEARCH_WINDOW), gap_hi + CUT_SEARCH_WINDOW)
+        cut = max(cut, prev_cut + 0.05)
         cut = min(cut, max(prev_cut + 0.05, audio_duration - 0.05))
         cut_points.append(cut)
         prev_cut = cut
@@ -268,14 +271,23 @@ def plan_alignment(timings: list[TimingEntry], audio_duration: float, silences: 
     audio_bounds: dict[int, tuple[float, float]] = {}
 
     for ents, (run_start, run_end) in zip(speech_groups, ranges):
-        bounds = [run_start]
-        for e in ents[1:]:
-            bounds.append(e.src_start if e.src_start is not None else run_start)
-        bounds.append(run_end)
-        for i in range(1, len(bounds)):
-            bounds[i] = max(bounds[i], bounds[i - 1] + 0.05)
+        raw_bounds = [e.src_start if e.src_start is not None else run_start for e in ents[1:]]
+        # ЖЁСТКИЙ ИНВАРИАНТ: границы зажимаются внутрь [run_start, run_end] — сумма
+        # длительностей рана всегда равна его куску озвучки. Кривые/немонотонные src
+        # => равномерное деление рана (шкала видео не может разойтись со звуком).
+        sane = all(run_start < b < run_end for b in raw_bounds) and all(
+            b2 > b1 for b1, b2 in zip(raw_bounds, raw_bounds[1:])
+        )
+        if not sane and raw_bounds:
+            log(f"    ⚠️ src-границы внутри рана {run_start:.2f}-{run_end:.2f}s кривые — делю ран поровну")
+            step = (run_end - run_start) / len(ents)
+            raw_bounds = [run_start + step * (k + 1) for k in range(len(ents) - 1)]
+
+        bounds = [run_start] + raw_bounds + [run_end]
+        for i in range(1, len(bounds) - 1):
+            bounds[i] = min(max(bounds[i], bounds[i - 1] + 0.05), run_end - 0.05 * (len(bounds) - 1 - i))
         for e, seg_start, seg_end in zip(ents, bounds, bounds[1:]):
-            entry_durations[pos_of[id(e)]] = seg_end - seg_start
+            entry_durations[pos_of[id(e)]] = max(0.05, seg_end - seg_start)
             audio_bounds[pos_of[id(e)]] = (seg_start, seg_end)
 
     for t in timings:

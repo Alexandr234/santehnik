@@ -872,6 +872,9 @@ def plan_voice_alignment(
         if gap_hi < gap_lo:
             gap_lo, gap_hi = gap_hi, gap_lo
         cut, snapped = choose_cut_point(gap_lo, gap_hi, silences, prev_cut)
+        # Разрез не может уйти далеко от границы фраз и обязан оставаться монотонным.
+        cut = min(max(cut, gap_lo - CUT_SEARCH_WINDOW), gap_hi + CUT_SEARCH_WINDOW)
+        cut = max(cut, prev_cut + 0.05)
         cut = min(cut, max(prev_cut + 0.05, audio_duration - 0.05))
         cuts.append(cut)
         prev_cut = cut
@@ -892,19 +895,31 @@ def plan_voice_alignment(
 
     # Плановые длительности позиций: внутри рана границы сегментов идут по src_start
     # следующих фраз (сдвиг картинки может попасть на слово — для ВИДЕО это нормально),
-    # а весь ран целиком точно равен своему куску озвучки.
+    # а весь ран целиком ТОЧНО равен своему куску озвучки.
+    #
+    # ЖЁСТКИЙ ИНВАРИАНТ: все границы зажимаются внутрь [run_start, run_end], поэтому
+    # сумма длительностей сегментов рана == длине его куска озвучки, что бы ни лежало
+    # в src (кривые/немонотонные значения не могут раздуть или сжать шкалу — иначе
+    # видеоряд становится длиннее звука и в конце ролика пропадает звук).
     entry_durations: list[float] = [0.0] * len(timings)
     pos_of = {id(t): i for i, t in enumerate(timings)}
 
     for ents, (run_start, run_end) in zip(speech_groups, ranges):
-        bounds = [run_start]
-        for e in ents[1:]:
-            bounds.append(e.src_start if e.src_start is not None else e.start)
-        bounds.append(run_end)
-        for i in range(1, len(bounds)):
-            bounds[i] = max(bounds[i], bounds[i - 1] + 0.05)
+        raw_bounds = [e.src_start if e.src_start is not None else run_start for e in ents[1:]]
+        # Кривые src (вне рана / немонотонные) => равномерное деление рана.
+        sane = all(run_start < b < run_end for b in raw_bounds) and all(
+            b2 > b1 for b1, b2 in zip(raw_bounds, raw_bounds[1:])
+        )
+        if not sane and raw_bounds:
+            log(f"    ⚠️ src-границы внутри рана {run_start:.2f}-{run_end:.2f}s кривые — делю ран поровну")
+            step = (run_end - run_start) / len(ents)
+            raw_bounds = [run_start + step * (k + 1) for k in range(len(ents) - 1)]
+
+        bounds = [run_start] + raw_bounds + [run_end]
+        for i in range(1, len(bounds) - 1):
+            bounds[i] = min(max(bounds[i], bounds[i - 1] + 0.05), run_end - 0.05 * (len(bounds) - 1 - i))
         for e, seg_start, seg_end in zip(ents, bounds, bounds[1:]):
-            entry_durations[pos_of[id(e)]] = seg_end - seg_start
+            entry_durations[pos_of[id(e)]] = max(0.05, seg_end - seg_start)
 
     for t in timings:
         if t.kind == "broll":
@@ -927,6 +942,18 @@ def plan_voice_alignment(
     )
     if natural_gaps > 0.3:
         log(f"Естественные паузы дыхания в озвучке: ~{natural_gaps:.1f}s — сохраняются полностью")
+
+    # КОНТРОЛЬ ИНВАРИАНТА: шкала видео обязана совпадать со звуковой дорожкой.
+    timeline_total = sum(entry_durations)
+    voice_total = sum(
+        (item[2] - item[1]) if item[0] == "audio" else item[1]
+        for item in sequence
+    )
+    if abs(timeline_total - voice_total) > 0.5:
+        log(f"⚠️ РАССИНХРОН ПЛАНА: видеошкала {timeline_total:.2f}s != звук {voice_total:.2f}s. "
+            f"Проверь src-поля в файле таймингов (это не должно происходить — сообщи разработчику).")
+    else:
+        log(f"План монтажа согласован: видеошкала == звук == {timeline_total:.2f}s")
 
     return entry_durations, sequence
 
@@ -952,6 +979,15 @@ def load_cutplan(lang: str, timings: list[TimingEntry], audio_duration: float) -
     if abs(plan_audio - audio_duration) > 0.5:
         log(f"⚠️ cutplan {path.name} сделан для другой озвучки "
             f"({plan_audio:.2f}s vs {audio_duration:.2f}s) — анализирую озвучку сам")
+        return None
+    # Структура (порядок speech/broll) обязана совпадать: если после анализатора
+    # запускался перемонтаж/пайплайн, план мог устареть при том же числе позиций.
+    plan_kinds = [str(e.get("kind", "speech")) for e in entries]
+    now_kinds = [t.kind for t in timings]
+    if plan_kinds != now_kinds:
+        log(f"⚠️ cutplan {path.name} не совпадает с текущим порядком speech/broll "
+            f"(тайминги менялись после анализа) — анализирую озвучку сам. "
+            f"Перезапусти analyze_voiceover_cutplan.py, чтобы обновить план.")
         return None
 
     durations = [float(e["duration"]) for e in entries]
@@ -1088,6 +1124,9 @@ def mux_final(
             "-i", str(voice_wav),
             "-map", "0:v:0",
             "-map", "1:a:0",
+            # Страховка: если голос чуть короче видеоряда, добиваем тишиной до конца,
+            # чтобы аудиопоток не обрывался раньше картинки.
+            "-af", f"apad=whole_dur={total_duration:.3f}",
             "-c:v", "copy",
             "-c:a", AUDIO_CODEC,
             "-b:a", AUDIO_BITRATE,
@@ -1099,12 +1138,15 @@ def mux_final(
         run_ffmpeg(cmd, "финальная сборка")
         return
 
+    # duration=longest + apad: даже при небольшом расхождении длин голоса/природы
+    # звук гарантированно тянется до конца видеоряда.
     filter_complex = (
         f"[2:a]volume={AMBIENT_VOLUME:.3f}[amb0];"
         f"[1:a]asplit=2[vo1][vo2];"
         f"[amb0][vo1]sidechaincompress="
         f"threshold={DUCK_THRESHOLD}:ratio={DUCK_RATIO}:attack={DUCK_ATTACK_MS}:release={DUCK_RELEASE_MS}[ambduck];"
-        f"[vo2][ambduck]amix=inputs=2:duration=first:normalize=0[aout]"
+        f"[vo2][ambduck]amix=inputs=2:duration=longest:normalize=0,"
+        f"apad=whole_dur={total_duration:.3f}[aout]"
     )
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
@@ -1123,6 +1165,43 @@ def mux_final(
     ]
     log("Финальная сборка: голос диктора + природа из клипов (ducking под голосом)")
     run_ffmpeg(cmd, "финальная сборка")
+
+
+def verify_output_audio(output_path: Path, total_duration: float) -> None:
+    """Самопроверка готового ролика: ищет длинные мёртвые зоны в звуке (>8s тишины).
+
+    Обычные паузы-перебивки короче и заполнены природой, поэтому длинная тишина —
+    признак проблемы (рассинхрон плана, оборванная дорожка). Печатает предупреждение
+    с таймкодами, чтобы проблему было видно сразу в консоли, а не после просмотра.
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner", "-nostats",
+        "-i", str(output_path),
+        "-af", "silencedetect=noise=-60dB:d=8",
+        "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    text = result.stderr or ""
+    problems: list[tuple[float, float]] = []
+    pending: Optional[float] = None
+    for m in re.finditer(r"silence_(start|end):\s*([0-9.]+)", text):
+        kind, value = m.group(1), float(m.group(2))
+        if kind == "start":
+            pending = value
+        elif pending is not None:
+            problems.append((pending, value))
+            pending = None
+    if pending is not None and total_duration - pending > 2.0:
+        problems.append((pending, total_duration))
+
+    if problems:
+        log("⚠️ ПРОВЕРКА ЗВУКА: в готовом ролике найдены длинные немые участки:")
+        for a, b in problems:
+            log(f"    тишина {a:.1f}s — {b:.1f}s (длина {b - a:.1f}s)")
+        log("    Это признак рассинхрона. Проверь предупреждения выше и перезапусти "
+            "analyze_voiceover_cutplan.py, затем сборку.")
+    else:
+        log("Проверка звука: длинных немых участков нет ✅")
 
 ################################################
 # 5. ОДИН ЯЗЫКОВОЙ РОЛИК
@@ -1188,6 +1267,9 @@ def build_video_for_language(lang: str, audio_path: Path, visual_dir: Path) -> b
                 output_path=output_path,
                 total_duration=total_duration,
             )
+
+            # 4) Самопроверка звука готового файла (мёртвые зоны видно сразу).
+            verify_output_audio(output_path, total_duration)
 
         elapsed_min = (time.time() - start_time) / 60
         log(f"✅ Готово {lang}: {output_path}")
