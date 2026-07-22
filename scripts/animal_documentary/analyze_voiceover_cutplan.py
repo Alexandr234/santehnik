@@ -363,6 +363,7 @@ def process_locale(locale: str, base_folder: Path, noise_db: float, min_dur: flo
         f"(озвучка {audio_duration:.2f}s + паузы {total_timeline - audio_duration:.2f}s)")
 
     plan = {
+        "cutplan_version": 2,
         "locale": locale,
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "audio_file": audio_path.name,

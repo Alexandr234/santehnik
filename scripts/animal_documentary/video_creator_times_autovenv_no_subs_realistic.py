@@ -980,6 +980,13 @@ def load_cutplan(lang: str, timings: list[TimingEntry], audio_duration: float) -
         log(f"⚠️ cutplan {path.name} сделан для другой озвучки "
             f"({plan_audio:.2f}s vs {audio_duration:.2f}s) — анализирую озвучку сам")
         return None
+    # Планы старых версий анализатора могли содержать рассинхронизированные диапазоны
+    # (симптом: звук пропадает с середины ролика). Требуем версию 2+.
+    if int(data.get("cutplan_version", 1)) < 2:
+        log(f"⚠️ cutplan {path.name} создан старой версией анализатора — игнорирую его. "
+            f"Перезапусти НОВЫЙ analyze_voiceover_cutplan.py (или просто удали старые cutplan_*.json).")
+        return None
+
     # Структура (порядок speech/broll) обязана совпадать: если после анализатора
     # запускался перемонтаж/пайплайн, план мог устареть при том же числе позиций.
     plan_kinds = [str(e.get("kind", "speech")) for e in entries]
@@ -997,6 +1004,27 @@ def load_cutplan(lang: str, timings: list[TimingEntry], audio_duration: float) -
             sequence.append(("audio", float(item[1]), float(item[2])))
         else:
             sequence.append(("silence", float(item[1])))
+
+    # ВНУТРЕННЯЯ СОГЛАСОВАННОСТЬ ПЛАНА (защита от битых/старых планов):
+    #  - audio-куски идут стык-в-стык и покрывают ВСЮ озвучку (от 0 до конца);
+    #  - видеошкала (sum durations) совпадает со звуковой (sum sequence).
+    audio_items = [it for it in sequence if it[0] == "audio"]
+    covered = sum(b - a for _t, a, b in audio_items)
+    contiguous = (
+        bool(audio_items)
+        and abs(audio_items[0][1]) < 0.2
+        and abs(audio_items[-1][2] - audio_duration) < 0.6
+        and all(abs(audio_items[i][2] - audio_items[i + 1][1]) < 0.2 for i in range(len(audio_items) - 1))
+    )
+    timeline_total = sum(durations)
+    voice_total = sum((it[2] - it[1]) if it[0] == "audio" else it[1] for it in sequence)
+    if not contiguous or abs(covered - audio_duration) > 1.0 or abs(timeline_total - voice_total) > 0.5:
+        log(f"⚠️ cutplan {path.name} внутренне противоречив "
+            f"(покрытие озвучки {covered:.1f}/{audio_duration:.1f}s, "
+            f"шкала {timeline_total:.1f}s vs звук {voice_total:.1f}s, стыки: {'ок' if contiguous else 'РВАНЫЕ'}) "
+            f"— игнорирую его и анализирую озвучку сам. Перезапусти новый analyze_voiceover_cutplan.py.")
+        return None
+
     log(f"Использую точный план монтажа: {path.name}")
     return durations, sequence
 
