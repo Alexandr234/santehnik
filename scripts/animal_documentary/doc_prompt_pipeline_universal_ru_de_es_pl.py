@@ -17,6 +17,9 @@ Pipeline: 4 language voiceovers -> Whisper transcription -> SRT -> visual blocks
     - как в настоящем документальном фильме, МЕЖДУ ФРАЗАМИ диктора вставляются ПАУЗЫ,
       и на каждую паузу генерируется отдельный B-ROLL кадр с животными/природой
       (перебивка без слов: только картинка и живые звуки природы);
+    - пауза ставится ТОЛЬКО после завершённого предложения (. ! ? …): если визуальный
+      блок оборвался посреди мысли, речь продолжается без разрыва, а пауза уезжает
+      к концу ближайшего законченного предложения — никаких «обрывистых» пауз;
     - итоговые файлы таймингов содержат РАСТЯНУТУЮ временную шкалу:
         * строки `type: speech` — фразы диктора, с полем `src: ... --> ...`
           (положение этой фразы в ИСХОДНОЙ озвучке);
@@ -858,20 +861,55 @@ def pause_duration_for(i: int, base_seconds: float) -> float:
     return max(PAUSE_MIN_SECONDS, min(PAUSE_MAX_SECONDS, base_seconds * factor))
 
 
+# Фраза считается ЗАВЕРШЁННОЙ, только если заканчивается точкой/!/?/…
+# (возможно с закрывающей кавычкой/скобкой после знака).
+SENTENCE_END_RE = re.compile(r"[.!?…]+[»\"'\)\]]*\s*$")
+
+
+def phrase_is_complete(text: str) -> bool:
+    return bool(SENTENCE_END_RE.search(clean_text(text)))
+
+
+def choose_pause_positions(rows: list[PromptRow], pause_every: int) -> list[int]:
+    """Выбирает, ПОСЛЕ каких фраз можно ставить паузу-перебивку.
+
+    Ключевое правило (исправление «обрывистых» пауз): пауза допустима ТОЛЬКО после
+    фразы, которая заканчивается завершённым предложением (. ! ? …). Если блок
+    оборвался посреди мысли («...об одном из самых редких» -> «союзов»), пауза после
+    него НЕ ставится — речь продолжается без разрыва, а пауза сдвигается к концу
+    ближайшего завершённого предложения.
+
+    pause_every применяется к ЗАВЕРШЁННЫМ фразам: пауза после каждой N-й из них.
+    После самой последней фразы пауза тоже допускается (финальный кадр природы).
+    """
+    positions: list[int] = []
+    eligible_seen = 0
+    for i, r in enumerate(rows):
+        if not phrase_is_complete(r.text):
+            continue
+        eligible_seen += 1
+        if pause_every > 0 and eligible_seen % pause_every == 0:
+            positions.append(i)
+    return positions
+
+
 def build_timeline_with_pauses(
     rows: list[PromptRow],
     broll_scenes: list[str],
-    pause_every: int,
+    pause_after: list[int],
     base_pause_seconds: float,
 ) -> list[TimelineEntry]:
     """Строит финальную шкалу: фразы диктора + паузы-перебивки между ними.
 
-    Времена фраз сдвигаются на суммарную длительность уже вставленных пауз,
-    а исходное положение фразы в озвучке сохраняется в src_start/src_end.
+    Пауза вставляется только после фраз из pause_after (индексы rows) — то есть
+    только на границах завершённых предложений. Времена фраз сдвигаются на
+    суммарную длительность уже вставленных пауз, а исходное положение фразы
+    в озвучке сохраняется в src_start/src_end.
     """
     entries: list[TimelineEntry] = []
     shift = 0.0
     broll_used = 0
+    pause_set = set(pause_after)
 
     for i, r in enumerate(rows):
         entries.append(TimelineEntry(
@@ -886,7 +924,7 @@ def build_timeline_with_pauses(
             image_prompt=r.image_prompt,
         ))
 
-        insert_pause = pause_every > 0 and ((i + 1) % pause_every == 0)
+        insert_pause = i in pause_set
         if insert_pause and broll_used < len(broll_scenes):
             dur = pause_duration_for(i, base_pause_seconds)
             scene = broll_scenes[broll_used]
@@ -910,10 +948,6 @@ def build_timeline_with_pauses(
     return entries
 
 
-def count_pauses(rows_count: int, pause_every: int) -> int:
-    if pause_every <= 0 or rows_count <= 0:
-        return 0
-    return rows_count // pause_every
 
 
 def generate_prompts(
@@ -1181,20 +1215,30 @@ def process_file(
     blocks = build_visual_blocks(segments, target_seconds=target_seconds)
     rows, brief, theme_brief_text = generate_prompts(client, blocks, language_code)
 
-    # Документальные паузы: b-roll перебивки с животными между фразами диктора.
+    # Документальные паузы: b-roll перебивки с животными — ТОЛЬКО на границах
+    # завершённых предложений, чтобы речь не обрывалась посреди мысли.
+    pause_positions: list[int] = []
+    broll_scenes: list[str] = []
     if pauses_enabled and pause_every > 0:
-        broll_needed = count_pauses(len(rows), pause_every)
-        print(f"Inserting documentary pauses for {language_code.upper()}: "
-              f"{broll_needed} b-roll cutaways (~{pause_seconds:.1f}s each, every {pause_every} phrase(s))")
-        broll_scenes = generate_broll_prompts(client, brief, theme_brief_text, broll_needed, language_code)
+        pause_positions = choose_pause_positions(rows, pause_every)
+        incomplete = sum(1 for r in rows if not phrase_is_complete(r.text))
+        if incomplete:
+            print(f"INFO: {incomplete} block(s) end mid-sentence — no pause will be placed after them.")
+        if not pause_positions:
+            print("WARNING: no complete-sentence boundaries found (transcript without punctuation?). "
+                  "No documentary pauses will be inserted.")
+        else:
+            print(f"Inserting documentary pauses for {language_code.upper()}: "
+                  f"{len(pause_positions)} b-roll cutaways (~{pause_seconds:.1f}s each) "
+                  f"at sentence boundaries only")
+            broll_scenes = generate_broll_prompts(client, brief, theme_brief_text, len(pause_positions), language_code)
     else:
-        broll_scenes = []
         print(f"Documentary pauses disabled for {language_code.upper()}")
 
     entries = build_timeline_with_pauses(
         rows=rows,
         broll_scenes=broll_scenes,
-        pause_every=pause_every if (pauses_enabled and broll_scenes) else 0,
+        pause_after=pause_positions if broll_scenes else [],
         base_pause_seconds=pause_seconds,
     )
 
