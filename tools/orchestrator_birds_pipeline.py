@@ -62,15 +62,8 @@ MAX_LINES = 20000          # сколько строк держать в окн�
 
 
 def resolve_python(script: Path) -> str:
-    """Питон для запуска шага: локальный venv рядом со скриптом, иначе текущий."""
-    for candidate in (
-        script.parent / ".venv" / "bin" / "python",
-        script.parent / "venv" / "bin" / "python",
-        BASE / ".venv" / "bin" / "python",
-        BASE / "venv" / "bin" / "python",
-    ):
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
+    """Шаги запускаются тем же Python, которым запущен сам оркестратор —
+    ровно как при ручном запуске `python3 script.py`."""
     exe = sys.executable or "python3"
     # pythonw не умеет нормально отдавать вывод дочерних процессов
     return exe.replace("pythonw", "python")
