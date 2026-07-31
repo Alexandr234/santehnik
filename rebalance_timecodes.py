@@ -29,8 +29,13 @@ rebalance_timecodes.py — перераспределение слотов в vi
 
 ЗАПУСК
 ======
-    python rebalance_timecodes.py /path/to/video_timecodes.json
-    python rebalance_timecodes.py /path/to/video_timecodes.txt   # если json нет
+    python rebalance_timecodes.py
+        # без аргументов: сам берёт video_timecodes.json из базовой папки
+        # конвейера (PROMPTS_BASE_DIR, по умолчанию ~/Desktop/ПРОМПТЫ) и
+        # папку ВИДЕО оттуда же.
+
+    python rebalance_timecodes.py /path/to/video_timecodes.json   # явный путь
+    python rebalance_timecodes.py /path/to/video_timecodes.txt    # если json нет
 
     Опции:
       --max-stretch 1.6    потолок slot/clip (насколько можно замедлить клип)
@@ -50,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -58,6 +64,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 EPS = 1e-4
+
+# Та же базовая папка, что и в остальных скриптах конвейера.
+BASE_DIR = Path(os.getenv("PROMPTS_BASE_DIR", "/Users/aleksandrtomilov/Desktop/ПРОМПТЫ"))
+DEFAULT_VIDEOS_DIR = BASE_DIR / "ВИДЕО"
 
 
 def info(msg: str) -> None:
@@ -343,13 +353,30 @@ def write_txt(payload: Dict[str, Any], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def find_default_input() -> Path:
+    """
+    Ищет файл тайм-кодов, если он не указан аргументом:
+    сначала в текущей папке, потом в BASE_DIR; json предпочтительнее txt.
+    """
+    for folder in (Path.cwd(), BASE_DIR):
+        for name in ("video_timecodes.json", "video_timecodes.txt"):
+            cand = folder / name
+            if cand.exists():
+                return cand
+    fail(f"Не нашёл video_timecodes.json/.txt ни в {Path.cwd()}, ни в {BASE_DIR}. "
+         f"Укажи путь аргументом или задай PROMPTS_BASE_DIR.")
+    raise SystemExit  # для type-checker'а; fail() уже завершил процесс
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Перераспределяет время переполненных слотов тайм-кодов на "
                     "соседние клипы (без лупов и фризов)."
     )
-    parser.add_argument("input", type=Path,
-                        help="video_timecodes[_xx].json или .txt")
+    parser.add_argument("input", type=Path, nargs="?", default=None,
+                        help="video_timecodes[_xx].json или .txt. Если не указан — "
+                             "ищется автоматически в текущей папке и в "
+                             f"{BASE_DIR}.")
     parser.add_argument("--max-stretch", type=float, default=1.6,
                         help="Потолок slot/clip (по умолчанию 1.6 — лёгкое замедление).")
     parser.add_argument("--clip-seconds", type=float, default=8.0,
@@ -362,10 +389,20 @@ def main() -> None:
                         help="Только отчёт, без записи файлов.")
     args = parser.parse_args()
 
+    if args.input is None:
+        args.input = find_default_input()
+        info(f"Файл тайм-кодов не указан — беру {args.input}")
     if not args.input.exists():
         fail(f"Нет входного файла: {args.input}")
     if args.max_stretch < 1.0:
         fail("--max-stretch должен быть >= 1.0")
+    if args.videos_dir is None:
+        for cand in (Path.cwd() / "ВИДЕО", DEFAULT_VIDEOS_DIR,
+                     args.input.resolve().parent / "ВИДЕО"):
+            if cand.is_dir():
+                args.videos_dir = cand
+                info(f"Папка с роликами: {cand}")
+                break
 
     payload = load_payload(args.input)
     payload = apply_rebalance(payload, args.videos_dir, args.clip_seconds, args.max_stretch)
