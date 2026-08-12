@@ -245,9 +245,16 @@ def main() -> None:
     print(f"К обработке идей: {len(queue)}")
 
     client = OpenAI(api_key=config.OPENAI_API_KEY)
-    appearance = analyze_face(
-        client, config.FACE_PHOTO, config.CACHE_DIR / FACE_PROFILE_CACHE, force=args.refresh_face
-    )
+    try:
+        appearance = analyze_face(
+            client, config.FACE_PHOTO, config.CACHE_DIR / FACE_PROFILE_CACHE, force=args.refresh_face
+        )
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        from step1_ideas import explain_openai_error  # noqa: PLC0415
+
+        raise SystemExit(explain_openai_error(exc)) from None
 
     done = 0
     for idea in queue:

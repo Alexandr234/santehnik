@@ -227,8 +227,13 @@ def analyze_performance(client: OpenAI, rows: list[dict]) -> dict:
         return {}
 
 
-def format_analysis(analysis: dict) -> str:
+def format_analysis(analysis: dict, rows_count: int = 0) -> str:
     if not analysis:
+        if rows_count:
+            return (
+                f"Статистика есть ({rows_count} роликов), но разобрать её не удалось.\n"
+                "Придумываю идеи без учёта просмотров — попробуйте запустить ещё раз позже."
+            )
         return (
             "Статистики пока нет — ни у одной идеи не заполнено поле ПРОСМОТРЫ.\n"
             "Придумываю разноплановые идеи, чтобы набрать первые данные."
@@ -329,6 +334,31 @@ FIRST_PERSON_MARKERS = (
 )
 
 
+def explain_openai_error(exc: Exception) -> str:
+    """Понятное сообщение вместо простыни трейсбека."""
+    name = type(exc).__name__
+    if "Authentication" in name or "PermissionDenied" in name:
+        return (
+            "Ключ OPENAI_API_KEY недействителен.\n"
+            "Проверьте его на platform.openai.com и пропишите заново:\n"
+            "  export OPENAI_API_KEY='sk-...'"
+        )
+    if "Connection" in name or "Timeout" in name:
+        return (
+            "Нет связи с OpenAI.\n"
+            "Проверьте интернет, а если пользуетесь VPN или прокси — что они включены."
+        )
+    if "RateLimit" in name:
+        return (
+            "OpenAI отвечает «превышен лимит».\n"
+            "Обычно это значит, что закончились средства на балансе, "
+            "либо слишком много запросов подряд — подождите минуту и повторите."
+        )
+    if "BadRequest" in name:
+        return f"OpenAI отклонил запрос: {exc}"
+    return f"Ошибка при обращении к OpenAI ({name}): {exc}"
+
+
 def check_idea(raw: dict) -> list[str]:
     """Возвращает список замечаний к идее. Пустой список = всё в порядке."""
     problems: list[str] = []
@@ -388,7 +418,8 @@ def main() -> None:
             print(f"\nЗабраковано идей: {rejected}. В работу они больше не пойдут.")
         else:
             print("Все новые идеи прошли проверку — чистить нечего.")
-        print()
+        # --clean — отдельный режим: только чистка, новые идеи не придумываем
+        return
 
     print(f"Файл идей: {ideas_path}")
     print(f"Всего идей в файле: {len(ideas)}")
@@ -406,10 +437,13 @@ def main() -> None:
     if rows:
         print("Топ по просмотрам:")
         for row in rows[:5]:
-            print(f"  {row['просмотры']:>9,} — {row['название']} | «{row['надпись']}»".replace(",", " "))
+            # разделитель разрядов ставим только в числе, а не во всей строке,
+            # иначе запятые пропадают из самой надписи
+            views = f"{row['просмотры']:,}".replace(",", " ")
+            print(f"  {views:>9} — {row['название']} | «{row['надпись']}»")
 
     analysis = analyze_performance(client, rows) if rows else {}
-    report = format_analysis(analysis)
+    report = format_analysis(analysis, len(rows))
     print("\n" + report)
 
     analytics_path = config.CACHE_DIR / "аналитика.txt"
@@ -428,7 +462,10 @@ def main() -> None:
     # и на формат надписи, и мы всё равно наберём нужное количество.
     want = args.count
     print(f"\nГенерирую {want} новых идей...")
-    raw_ideas = generate_ideas(client, want + 2, analysis, ideas)
+    try:
+        raw_ideas = generate_ideas(client, want + 2, analysis, ideas)
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(explain_openai_error(exc)) from None
     if not raw_ideas:
         print("GPT не вернул ни одной идеи. Попробуйте запустить ещё раз.")
         return
