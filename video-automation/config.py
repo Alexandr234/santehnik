@@ -69,6 +69,7 @@ MUSIC_DIR = BASE_DIR / "мелодии"
 OUTPUT_DIR = BASE_DIR / "ГОТОВОЕ"          # смонтированные ролики
 PHOTOS_DIR = BASE_DIR / "ФОТО"             # сгенерированные фото
 VIDEOS_DIR = BASE_DIR / "ВИДЕО"            # оживлённые фото
+DESCRIPTIONS_DIR = BASE_DIR / "ОПИСАНИЯ"   # готовые тексты под ролики
 CACHE_DIR = BASE_DIR / "_кэш"              # профиль лица, логи, аналитика
 
 
@@ -169,7 +170,7 @@ def font_path() -> str:
 
 
 def ensure_dirs() -> None:
-    for folder in (OUTPUT_DIR, PHOTOS_DIR, VIDEOS_DIR, CACHE_DIR):
+    for folder in (OUTPUT_DIR, PHOTOS_DIR, VIDEOS_DIR, DESCRIPTIONS_DIR, CACHE_DIR):
         folder.mkdir(parents=True, exist_ok=True)
 
 

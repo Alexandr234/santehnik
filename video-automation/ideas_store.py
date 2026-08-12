@@ -54,6 +54,7 @@ FIELD_ORDER = [
     "НАДПИСЬ",
     "ОПИСАНИЕ",
     "ПРОМПТ_ФОТО",
+    "ОПИСАНИЕ_ФАЙЛ",
     "ПРОСМОТРЫ",
     "ФОТО_ФАЙЛ",
     "ВИДЕО_ФАЙЛ",
@@ -77,6 +78,7 @@ class Idea:
     caption: str = ""          # НАДПИСЬ — текст поверх видео
     description: str = ""
     photo_prompt: str = ""
+    post_file: str = ""        # ОПИСАНИЕ_ФАЙЛ — путь к готовому тексту под ролик
     views: str = ""            # ПРОСМОТРЫ — заполняется вручную
     photo_file: str = ""
     video_file: str = ""
@@ -115,6 +117,7 @@ class Idea:
             "НАДПИСЬ": self.caption,
             "ОПИСАНИЕ": self.description,
             "ПРОМПТ_ФОТО": self.photo_prompt,
+            "ОПИСАНИЕ_ФАЙЛ": self.post_file,
             "ПРОСМОТРЫ": self.views,
             "ФОТО_ФАЙЛ": self.photo_file,
             "ВИДЕО_ФАЙЛ": self.video_file,
@@ -145,7 +148,7 @@ def _build_idea(number: int, fields: dict[str, list[str]]) -> Idea:
 
     known = {
         "СТАТУС", "НАЗВАНИЕ", "НАДПИСЬ", "ОПИСАНИЕ", "ПРОМПТ_ФОТО",
-        "ПРОСМОТРЫ", "ФОТО_ФАЙЛ", "ВИДЕО_ФАЙЛ", "РОЛИК_ФАЙЛ", "ДАТА",
+        "ОПИСАНИЕ_ФАЙЛ", "ПРОСМОТРЫ", "ФОТО_ФАЙЛ", "ВИДЕО_ФАЙЛ", "РОЛИК_ФАЙЛ", "ДАТА",
     }
     extra = {k: "\n".join(v).strip() for k, v in fields.items() if k not in known}
 
@@ -160,6 +163,7 @@ def _build_idea(number: int, fields: dict[str, list[str]]) -> Idea:
         caption=get("НАДПИСЬ"),
         description=get("ОПИСАНИЕ"),
         photo_prompt=get("ПРОМПТ_ФОТО"),
+        post_file=get("ОПИСАНИЕ_ФАЙЛ"),
         views=get("ПРОСМОТРЫ"),
         photo_file=get("ФОТО_ФАЙЛ"),
         video_file=get("ВИДЕО_ФАЙЛ"),
