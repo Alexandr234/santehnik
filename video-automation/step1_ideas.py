@@ -33,8 +33,8 @@ from openai import OpenAI
 
 import config
 from ideas_store import (
-    STATUS_DONE,
     STATUS_NEW,
+    STATUS_REJECTED,
     Idea,
     load_ideas,
     next_number,
@@ -310,10 +310,17 @@ def generate_ideas(
 
 # Слова, по которым видно, что сцена «нейросетевая», а не бытовая
 UNREALISTIC_MARKERS = (
-    "парашют", "скалолаз", "яхт", "джет", "красная дорожка", "тигр", "льв",
-    "космос", "космич", "подводн", "джунгл", "пустын", "супергеро",
-    "обложк", "смокинг", "лимузин", "rolls", "royce", "феррари", "ferrari",
-    "миллион долларов", "чемодан денег", "горящ", "взрыв", "динозавр",
+    # экстрим и опасность
+    "парашют", "скалолаз", "горящ", "взрыв", "цунами", "лавин",
+    # экзотика и фантастика
+    "тигр", "льв", "слон", "динозавр", "дракон", "супергеро",
+    "космос", "космич", "марс", "луне", "невесомост", "инопланет",
+    "подводн", "под водой", "океан", "акул", "джунгл", "пустын",
+    # глянцевая роскошь
+    "яхт", "джет", "красная дорожка", "обложк", "смокинг", "лимузин",
+    "rolls", "royce", "феррари", "ferrari", "миллион долларов", "чемодан денег",
+    # исторические и монаршие декорации
+    "королев", "король", "трон", "замок", "средневеков", "рыцар", "дворц",
 )
 # Признаки надписи «от первого лица» — такие не обещают зрителю ничего
 FIRST_PERSON_MARKERS = (
@@ -348,6 +355,10 @@ def main() -> None:
     )
     parser.add_argument("--count", type=int, default=5, help="Сколько новых идей добавить (по умолчанию 5).")
     parser.add_argument("--only-analyze", action="store_true", help="Только аналитика, без добавления идей.")
+    parser.add_argument(
+        "--clean", action="store_true",
+        help="Проверить уже лежащие в файле НОВЫЕ идеи и забраковать неподходящие.",
+    )
     parser.add_argument("--ideas-file", default=str(config.IDEAS_FILE), help="Путь к ИДЕИ.txt")
     args = parser.parse_args()
 
@@ -356,6 +367,28 @@ def main() -> None:
 
     ideas_path = Path(args.ideas_file).expanduser()
     ideas = load_ideas(ideas_path)
+
+    # --- Чистка старых идей, не прошедших нынешние правила ---
+    if args.clean:
+        rejected = 0
+        for idea in ideas:
+            if idea.status != STATUS_NEW:
+                continue
+            problems = check_idea({
+                "надпись": idea.caption,
+                "описание": idea.description,
+                "промпт_фото": idea.photo_prompt,
+            })
+            if problems:
+                idea.status = STATUS_REJECTED
+                rejected += 1
+                print(f"  [{idea.number:03d}] отклонена «{idea.caption}»: {'; '.join(problems)}")
+        if rejected:
+            save_ideas(ideas_path, ideas)
+            print(f"\nЗабраковано идей: {rejected}. В работу они больше не пойдут.")
+        else:
+            print("Все новые идеи прошли проверку — чистить нечего.")
+        print()
 
     print(f"Файл идей: {ideas_path}")
     print(f"Всего идей в файле: {len(ideas)}")

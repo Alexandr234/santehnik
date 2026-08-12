@@ -43,8 +43,9 @@ STATUS_NEW = "НОВАЯ"
 STATUS_PHOTO = "ФОТО"
 STATUS_VIDEO = "ВИДЕО"
 STATUS_DONE = "СНЯТА"
+STATUS_REJECTED = "ОТКЛОНЕНА"   # идея не годится, в работу не берётся
 
-STATUS_ORDER = [STATUS_NEW, STATUS_PHOTO, STATUS_VIDEO, STATUS_DONE]
+STATUS_ORDER = [STATUS_NEW, STATUS_PHOTO, STATUS_VIDEO, STATUS_DONE, STATUS_REJECTED]
 
 # Поля в том порядке, в котором они пишутся в файл
 FIELD_ORDER = [
@@ -236,6 +237,7 @@ def save_ideas(path: Path, ideas: list[Idea], make_backup: bool = True) -> None:
         "#",
         "# СТАТУС меняют сами скрипты, руками трогать не нужно:",
         f"#   {STATUS_NEW} -> {STATUS_PHOTO} -> {STATUS_VIDEO} -> {STATUS_DONE} (идея отработана)",
+        f"#   {STATUS_REJECTED} — идея забракована и в работу не берётся",
         "",
     ]
 

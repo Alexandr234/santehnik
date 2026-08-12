@@ -170,17 +170,80 @@ def fit_caption(caption: str, font_path_str: str) -> tuple[list[str], int]:
     ), size
 
 
-def build_caption_filters(caption: str, work_dir: Path) -> str:
-    """Строит цепочку drawtext — по одному фильтру на строку, каждая по центру.
+def has_drawtext_filter() -> bool:
+    """Есть ли в этой сборке ffmpeg фильтр drawtext (нужен libfreetype)."""
+    global _DRAWTEXT_AVAILABLE
+    if _DRAWTEXT_AVAILABLE is None:
+        try:
+            result = subprocess.run(
+                ["ffmpeg", "-v", "quiet", "-filters"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
+            )
+            _DRAWTEXT_AVAILABLE = " drawtext " in result.stdout
+        except Exception:
+            _DRAWTEXT_AVAILABLE = False
+    return _DRAWTEXT_AVAILABLE
+
+
+_DRAWTEXT_AVAILABLE: bool | None = None
+
+
+def render_caption_png(caption: str, out_path: Path) -> bool:
+    """Рисует надпись в прозрачный PNG размером с кадр.
+
+    Так наложение работает на ЛЮБОЙ сборке ffmpeg — фильтр overlay есть везде,
+    в отличие от drawtext, которого нет в сборках без libfreetype.
+    Возвращает False, если Pillow не установлен.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFilter, ImageFont  # noqa: PLC0415
+    except ImportError:
+        return False
+
+    font_file = config.font_path()
+    lines, size = fit_caption(caption, font_file)
+    font = ImageFont.truetype(font_file, size)
+
+    canvas = Image.new("RGBA", (config.VIDEO_W, config.VIDEO_H), (0, 0, 0, 0))
+    line_height = size * config.TEXT_LINE_SPACING
+    top = config.VIDEO_H * config.TEXT_TOP_RATIO
+    stroke = max(4, size // 12)
+
+    # Мягкая тень отдельным слоем — она делает текст читаемым на светлом фоне
+    shadow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow)
+    offset = max(2, size // 18)
+    for index, line in enumerate(lines):
+        x = (config.VIDEO_W - font.getlength(line)) / 2
+        y = top + index * line_height
+        shadow_draw.text(
+            (x, y + offset), line, font=font,
+            fill=(0, 0, 0, 140), stroke_width=stroke, stroke_fill=(0, 0, 0, 140),
+        )
+    canvas = Image.alpha_composite(canvas, shadow.filter(ImageFilter.GaussianBlur(offset)))
+
+    # Основной текст: белый с плотной чёрной обводкой, как в референсе
+    draw = ImageDraw.Draw(canvas)
+    for index, line in enumerate(lines):
+        x = (config.VIDEO_W - font.getlength(line)) / 2
+        y = top + index * line_height
+        draw.text(
+            (x, y), line, font=font,
+            fill=(255, 255, 255, 255), stroke_width=stroke, stroke_fill=(0, 0, 0, 235),
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(out_path)
+    return True
+
+
+def build_caption_drawtext(caption: str, work_dir: Path) -> str:
+    """Запасной путь: цепочка drawtext, если Pillow нет, но drawtext доступен.
 
     Отдельный drawtext на строку нужен, чтобы каждая строка центрировалась
     сама по себе (в ffmpeg 6 многострочный блок центрируется целиком,
     и короткие строки прижимаются влево).
     """
-    caption = (caption or "").strip()
-    if not caption:
-        return ""
-
     font = config.font_path()
     lines, size = fit_caption(caption, font)
 
@@ -212,18 +275,44 @@ def build_hook(video_path: Path, caption: str, seconds: float, work_dir: Path) -
     out = work_dir / "seg1.mp4"
     source_duration = media_duration(video_path)
     take = min(seconds, source_duration)
+    caption = (caption or "").strip()
 
-    chain = normalize_filter()
-    caption_filters = build_caption_filters(caption, work_dir)
-    if caption_filters:
-        chain = f"{chain},{caption_filters}"
+    common = ["-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18"]
 
-    run_ffmpeg([
-        "-i", str(video_path), "-t", f"{take:.3f}",
-        "-vf", chain, "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        str(out),
-    ])
-    return out
+    if not caption:
+        run_ffmpeg([
+            "-i", str(video_path), "-t", f"{take:.3f}",
+            "-vf", normalize_filter(), *common, str(out),
+        ])
+        return out
+
+    # Основной путь: надпись рисуется в PNG и накладывается через overlay.
+    # Работает на любой сборке ffmpeg, в том числе без libfreetype.
+    caption_png = work_dir / "caption.png"
+    if render_caption_png(caption, caption_png):
+        run_ffmpeg([
+            "-i", str(video_path), "-loop", "1", "-i", str(caption_png),
+            "-t", f"{take:.3f}",
+            "-filter_complex",
+            f"[0:v]{normalize_filter()}[base];"
+            f"[base][1:v]overlay=0:0:eof_action=repeat,format=yuv420p[v]",
+            "-map", "[v]", *common, str(out),
+        ])
+        return out
+
+    # Запасной путь: drawtext, если Pillow не установлен
+    if has_drawtext_filter():
+        chain = f"{normalize_filter()},{build_caption_drawtext(caption, work_dir)}"
+        run_ffmpeg([
+            "-i", str(video_path), "-t", f"{take:.3f}",
+            "-vf", chain, *common, str(out),
+        ])
+        return out
+
+    raise RuntimeError(
+        "Нечем нарисовать надпись: не установлен Pillow, а в этой сборке ffmpeg "
+        "нет фильтра drawtext.\nУстановите Pillow:  pip3 install Pillow"
+    )
 
 
 def build_middle(video_path: Path, max_seconds: float, work_dir: Path) -> Path:

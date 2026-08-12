@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
@@ -61,7 +62,12 @@ def _safe_name(text: str) -> str:
 
 
 def animate_one(idea: Idea) -> tuple[Idea, bool, str]:
-    """Оживляет фото одной идеи. Возвращает (идея, успех, путь_или_ошибка)."""
+    """Оживляет фото одной идеи. Возвращает (идея, успех, путь_или_ошибка).
+
+    Временные ошибки провайдера («Generation failed, please try again later»)
+    повторяются до MAX_ATTEMPTS раз — так же, как в исходном рабочем скрипте.
+    Постоянные (safety-блок) не повторяются вовсе.
+    """
     photo_path = Path(idea.photo_file).expanduser()
     if not photo_path.exists():
         return idea, False, f"нет файла фото: {photo_path}"
@@ -71,19 +77,28 @@ def animate_one(idea: Idea) -> tuple[Idea, bool, str]:
         print(f"[{idea.number:03d}] уже оживлено, пропускаю: {out_path.name}")
         return idea, True, str(out_path)
 
-    print(f"[{idea.number:03d}] оживляю: {photo_path.name}")
-    try:
-        fastgen_client.animate_image(photo_path, ANIMATION_PROMPT, out_path)
-    except fastgen_client.PermanentError as exc:
-        print(f"[{idea.number:03d}] ЗАБЛОКИРОВАНО провайдером: {exc}")
-        return idea, False, str(exc)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[{idea.number:03d}] ОШИБКА: {exc}")
-        return idea, False, str(exc)
+    last_error = ""
+    for attempt in range(1, config.MAX_ATTEMPTS + 1):
+        print(f"[{idea.number:03d}] оживляю: {photo_path.name} | попытка {attempt}/{config.MAX_ATTEMPTS}")
+        try:
+            fastgen_client.animate_image(photo_path, ANIMATION_PROMPT, out_path)
+        except fastgen_client.PermanentError as exc:
+            print(f"[{idea.number:03d}] ЗАБЛОКИРОВАНО провайдером: {exc} — пропускаю без повтора")
+            return idea, False, str(exc)
+        except Exception as exc:  # noqa: BLE001
+            last_error = str(exc)
+            print(f"[{idea.number:03d}] ОШИБКА: {exc}")
+            if attempt < config.MAX_ATTEMPTS:
+                print(f"[{idea.number:03d}] повтор через {config.RETRY_DELAY_SEC}с...")
+                time.sleep(config.RETRY_DELAY_SEC)
+            continue
 
-    size_mb = out_path.stat().st_size / 1024 / 1024
-    print(f"[{idea.number:03d}] готово: {out_path.name} ({size_mb:.2f} MB)")
-    return idea, True, str(out_path)
+        size_mb = out_path.stat().st_size / 1024 / 1024
+        print(f"[{idea.number:03d}] готово: {out_path.name} ({size_mb:.2f} MB)")
+        return idea, True, str(out_path)
+
+    print(f"[{idea.number:03d}] не удалось за {config.MAX_ATTEMPTS} попыток")
+    return idea, False, last_error
 
 
 def main() -> None:
