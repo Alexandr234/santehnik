@@ -71,7 +71,9 @@ PROMPT_SYSTEM = """
   2. Сцену будущего фото.
 
 Собери один цельный промпт на русском языке, который:
-  - начинается с героя: его внешность (вплети описание естественно, не списком);
+  - начинается с героя: если внешность описана — вплети её естественно, не списком;
+    если сказано брать внешность с фото — пиши просто «мужчина с фото»
+    и НЕ придумывай никаких черт лица, возраста, причёски и бороды;
   - затем что он делает, поза, выражение лица;
   - затем окружение, другие люди, предметы;
   - затем место, свет, ракурс камеры;
@@ -132,13 +134,25 @@ def analyze_face(client: OpenAI, face_path: Path, cache_path: Path, force: bool 
     return appearance
 
 
-def build_photo_prompt(client: OpenAI, appearance: str, idea: Idea) -> str:
-    """Собирает финальный промпт: внешность + сцена идеи."""
+def build_photo_prompt(client: OpenAI, appearance: str, idea: Idea, with_appearance: bool = True) -> str:
+    """Собирает финальный промпт по сцене идеи.
+
+    with_appearance=False используется, когда лицо передаётся картинкой-референсом:
+    словесное описание внешности в этом случае ВРЕДИТ — модель начинает рисовать
+    «мужчину, подходящего под описание», вместо конкретного человека с фото.
+    """
     scene = idea.photo_prompt or idea.description or idea.title
-    user_prompt = (
-        f"ВНЕШНОСТЬ ГЕРОЯ:\n{appearance}\n\n"
-        f"СЦЕНА (идея «{idea.title}»):\n{scene}"
-    )
+    if with_appearance:
+        user_prompt = (
+            f"ВНЕШНОСТЬ ГЕРОЯ:\n{appearance}\n\n"
+            f"СЦЕНА (идея «{idea.title}»):\n{scene}"
+        )
+    else:
+        user_prompt = (
+            "ВНЕШНОСТЬ ГЕРОЯ: берётся с приложенного фото, описывать её словами НЕ НУЖНО. "
+            "Называй его просто «мужчина с фото».\n\n"
+            f"СЦЕНА (идея «{idea.title}»):\n{scene}"
+        )
     response = client.chat.completions.create(
         model=config.TEXT_MODEL,
         temperature=0.6,
@@ -152,21 +166,93 @@ def build_photo_prompt(client: OpenAI, appearance: str, idea: Idea) -> str:
     return prompt or scene
 
 
-def generate_with_openai(client: OpenAI, prompt: str, face_path: Path, out_path: Path) -> None:
-    """gpt-image-1: генерация с вашим фото как референсом — лучше держит лицо."""
-    with face_path.open("rb") as face_file:
-        response = client.images.edit(
-            model=config.OPENAI_IMAGE_MODEL,
-            image=[face_file],
-            prompt=(
-                "Сохрани лицо человека с приложенной фотографии — это должен быть "
-                "тот же самый человек, узнаваемый по чертам лица. "
-                f"Помести его в новую сцену:\n\n{prompt}"
-            ),
-            size=config.OPENAI_IMAGE_SIZE,
-        )
-    payload = response.data[0]
-    raw = base64.b64decode(payload.b64_json)
+IDENTITY_INSTRUCTION = (
+    "На приложенных фотографиях — конкретный реальный мужчина. "
+    "В результате должен быть ИМЕННО ОН, а не похожий на него человек.\n\n"
+    "СТРОГО СОХРАНИ БЕЗ ИЗМЕНЕНИЙ: форму и пропорции лица, форму и посадку глаз, "
+    "форму бровей, форму носа, форму губ, линию челюсти и подбородка, форму ушей, "
+    "линию роста волос, длину и форму бороды и усов, оттенок кожи, родинки и "
+    "любые особые приметы. Возраст оставь тот же.\n\n"
+    "НЕЛЬЗЯ: делать лицо моложе, стройнее, симметричнее или «красивее», "
+    "менять форму носа и губ, убирать морщины и родинки, менять причёску и бороду, "
+    "делать глянцевую ретушь кожи. Кожа должна остаться с реальной текстурой — "
+    "порами, неровностями и естественным блеском.\n\n"
+    "Меняй только одежду, позу, окружение и освещение — по описанию сцены ниже.\n\n"
+    "СЦЕНА:\n"
+)
+
+
+def collect_face_photos() -> list[Path]:
+    """Все доступные фото лица.
+
+    Если рядом есть папка ЛИЦО — берём оттуда до 4 снимков: чем больше ракурсов,
+    тем точнее модель держит внешность. Иначе используем одиночное фото из конфига.
+    """
+    photos: list[Path] = []
+    if config.FACE_DIR.exists():
+        photos = sorted(
+            p for p in config.FACE_DIR.iterdir()
+            if p.is_file()
+            and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+            and not p.name.startswith(".")
+        )[:4]
+    if not photos and config.FACE_PHOTO.exists():
+        photos = [config.FACE_PHOTO]
+    return photos
+
+
+def generate_with_openai(client: OpenAI, prompt: str, face_photos: list[Path], out_path: Path) -> None:
+    """gpt-image-1 с вашими фото как референсом.
+
+    input_fidelity="high" — ключевой параметр: именно он заставляет модель
+    держать черты лица с исходника, а не рисовать «похожего человека».
+    Если версия библиотеки или модель его не понимает — повторяем без него.
+    """
+    # От самого качественного набора параметров к самому совместимому
+    variants = [
+        {"input_fidelity": "high", "quality": "high"},
+        {"quality": "high"},
+        {},
+    ]
+
+    handles = [p.open("rb") for p in face_photos]
+    try:
+        response = None
+        last_error: Exception | None = None
+
+        for index, extra in enumerate(variants):
+            for handle in handles:
+                handle.seek(0)
+            try:
+                response = client.images.edit(
+                    model=config.OPENAI_IMAGE_MODEL,
+                    image=handles,
+                    prompt=IDENTITY_INSTRUCTION + prompt,
+                    size=config.OPENAI_IMAGE_SIZE,
+                    **extra,
+                )
+                break
+            except TypeError as exc:
+                # Старая версия библиотеки не знает такой параметр
+                last_error = exc
+            except Exception as exc:  # noqa: BLE001
+                message = str(exc).lower()
+                unsupported = any(
+                    marker in message
+                    for marker in ("unknown", "unsupported", "unexpected", "not permitted")
+                )
+                # Настоящую ошибку (нет доступа, кончились деньги) не маскируем
+                if not (unsupported and index < len(variants) - 1):
+                    raise
+                last_error = exc
+
+        if response is None:
+            raise RuntimeError(f"gpt-image-1 не принял запрос: {last_error}")
+    finally:
+        for handle in handles:
+            handle.close()
+
+    raw = base64.b64decode(response.data[0].b64_json)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(raw)
 
@@ -176,21 +262,23 @@ def process_idea(
     idea: Idea,
     appearance: str,
     backend: str,
+    face_photos: list[Path],
 ) -> tuple[bool, str]:
     """Возвращает (успех, путь к файлу или текст ошибки)."""
     print(f"\n[{idea.number:03d}] {idea.title}")
     print(f"      надпись: «{idea.caption}»")
 
-    prompt = build_photo_prompt(client, appearance, idea)
+    # При работе с картинкой-референсом словесное описание лица только мешает
+    prompt = build_photo_prompt(client, appearance, idea, with_appearance=(backend != "openai"))
     print(f"      промпт: {prompt[:110]}...")
 
     out_path = config.PHOTOS_DIR / f"{idea.number:03d}_{_safe_name(idea.title)}.png"
 
     try:
         if backend == "openai":
-            generate_with_openai(client, prompt, config.FACE_PHOTO, out_path)
+            generate_with_openai(client, prompt, face_photos, out_path)
         else:
-            fastgen_client.generate_image(prompt, out_path, reference_image=config.FACE_PHOTO)
+            fastgen_client.generate_image(prompt, out_path, reference_image=face_photos[0])
     except fastgen_client.PermanentError as exc:
         print(f"      ЗАБЛОКИРОВАНО: {exc}")
         return False, str(exc)
@@ -241,13 +329,27 @@ def main() -> None:
         print("Добавить новые: python3 step1_ideas.py")
         return
 
+    face_photos = collect_face_photos()
+    if not face_photos:
+        raise SystemExit(
+            f"Не найдено ни одного фото лица.\n"
+            f"Положите фото сюда: {config.FACE_PHOTO}\n"
+            f"или несколько снимков в папку: {config.FACE_DIR}"
+        )
+
     print(f"Бэкенд генерации: {args.backend}")
+    print(f"Фото лица: {len(face_photos)} шт. ({', '.join(p.name for p in face_photos)})")
+    if len(face_photos) == 1:
+        print(
+            "  Подсказка: чтобы лицо получалось точнее, положите 3-4 своих фото\n"
+            f"  (анфас, полуоборот, разный свет) в папку {config.FACE_DIR.name}"
+        )
     print(f"К обработке идей: {len(queue)}")
 
     client = OpenAI(api_key=config.OPENAI_API_KEY)
     try:
         appearance = analyze_face(
-            client, config.FACE_PHOTO, config.CACHE_DIR / FACE_PROFILE_CACHE, force=args.refresh_face
+            client, face_photos[0], config.CACHE_DIR / FACE_PROFILE_CACHE, force=args.refresh_face
         )
     except SystemExit:
         raise
@@ -258,7 +360,7 @@ def main() -> None:
 
     done = 0
     for idea in queue:
-        ok, result = process_idea(client, idea, appearance, args.backend)
+        ok, result = process_idea(client, idea, appearance, args.backend, face_photos)
         if ok:
             idea.photo_file = result
             idea.status = STATUS_PHOTO

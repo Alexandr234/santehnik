@@ -284,15 +284,34 @@ def check_files():
             config.IDEAS_FILE.write_text("", encoding="utf-8")
             ok("ИДЕИ.txt создан пустым")
 
-    checks = [
-        (config.FACE_PHOTO, "фото вашего лица", "нужно для генерации фото"),
-        (config.MIDDLE_VIDEO, "видеосреднее.mp4", "нужно для монтажа"),
-    ]
-    for path, label, why in checks:
-        if path.exists():
-            ok(f"{label}: {path.name}")
-        else:
-            fail(f"не найден {label} ({why}): {path}")
+    # Фото лица: папка ЛИЦО с несколькими снимками либо одиночный файл
+    face_photos = []
+    if config.FACE_DIR.exists():
+        face_photos = [
+            p for p in config.FACE_DIR.iterdir()
+            if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+            and not p.name.startswith(".")
+        ]
+    if face_photos:
+        ok(f"фото лица: {len(face_photos)} шт. из папки {config.FACE_DIR.name}")
+        if len(face_photos) < 3:
+            warn("для точного сходства лучше 3-4 снимка: анфас, полуоборот, разный свет")
+    elif config.FACE_PHOTO.exists():
+        ok(f"фото вашего лица: {config.FACE_PHOTO.name}")
+        print(
+            f"           Совет: положите 3-4 своих фото в папку «{config.FACE_DIR.name}»\n"
+            "           (анфас, полуоборот, разный свет) — сходство станет заметно точнее"
+        )
+    else:
+        fail(
+            f"не найдено фото лица (нужно для генерации): {config.FACE_PHOTO}\n"
+            f"             либо положите несколько снимков в папку {config.FACE_DIR}"
+        )
+
+    if config.MIDDLE_VIDEO.exists():
+        ok(f"видеосреднее.mp4: {config.MIDDLE_VIDEO.name}")
+    else:
+        fail(f"не найден видеосреднее.mp4 (нужен для монтажа): {config.MIDDLE_VIDEO}")
 
     if config.MUSIC_DIR.exists():
         tracks = [

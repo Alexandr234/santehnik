@@ -170,22 +170,30 @@ def fit_caption(caption: str, font_path_str: str) -> tuple[list[str], int]:
     ), size
 
 
-def has_drawtext_filter() -> bool:
-    """Есть ли в этой сборке ffmpeg фильтр drawtext (нужен libfreetype)."""
-    global _DRAWTEXT_AVAILABLE
-    if _DRAWTEXT_AVAILABLE is None:
+_FILTERS_CACHE: str | None = None
+
+
+def has_filter(name: str) -> bool:
+    """Есть ли в этой сборке ffmpeg такой фильтр.
+
+    Урезанные сборки нередко идут без drawtext (нет libfreetype), без zoompan
+    или без xfade — поэтому перед использованием проверяем, а не падаем.
+    """
+    global _FILTERS_CACHE
+    if _FILTERS_CACHE is None:
         try:
             result = subprocess.run(
                 ["ffmpeg", "-v", "quiet", "-filters"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
             )
-            _DRAWTEXT_AVAILABLE = " drawtext " in result.stdout
+            _FILTERS_CACHE = result.stdout
         except Exception:
-            _DRAWTEXT_AVAILABLE = False
-    return _DRAWTEXT_AVAILABLE
+            _FILTERS_CACHE = ""
+    return f" {name} " in _FILTERS_CACHE
 
 
-_DRAWTEXT_AVAILABLE: bool | None = None
+def has_drawtext_filter() -> bool:
+    return has_filter("drawtext")
 
 
 def render_caption_png(caption: str, out_path: Path) -> bool:
@@ -328,31 +336,74 @@ def build_middle(video_path: Path, max_seconds: float, work_dir: Path) -> Path:
 
 
 def build_final(photo_path: Path, seconds: float, work_dir: Path) -> Path:
-    """Часть 3: итоговое фото с медленным зумом."""
+    """Часть 3: ИТОГОВОЕ ФОТО — то самое, из которого делалось оживлённое видео.
+
+    Идёт последним, после средней части, и держится в кадре с медленным зумом.
+    """
     out = work_dir / "seg3.mp4"
     frames = int(seconds * config.VIDEO_FPS)
-    run_ffmpeg([
-        "-loop", "1", "-i", str(photo_path), "-t", f"{seconds:.3f}",
-        "-vf",
-        # Увеличиваем перед zoompan, иначе зум даёт заметное дрожание
-        f"scale={config.VIDEO_W * 2}:-2,"
-        f"zoompan=z='min(1+0.0011*on,1.10)'"
-        f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
-        f":d={frames}:s={config.VIDEO_W}x{config.VIDEO_H}:fps={config.VIDEO_FPS},"
-        f"setsar=1,format=yuv420p",
-        "-frames:v", str(frames),
-        "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        str(out),
-    ])
+    common = ["-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18"]
+
+    if has_filter("zoompan"):
+        run_ffmpeg([
+            "-loop", "1", "-i", str(photo_path), "-t", f"{seconds:.3f}",
+            "-vf",
+            # Увеличиваем перед zoompan, иначе зум даёт заметное дрожание
+            f"scale={config.VIDEO_W * 2}:-2,"
+            f"zoompan=z='min(1+0.0011*on,1.10)'"
+            f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f":d={frames}:s={config.VIDEO_W}x{config.VIDEO_H}:fps={config.VIDEO_FPS},"
+            f"setsar=1,format=yuv420p",
+            "-frames:v", str(frames), *common, str(out),
+        ])
+    else:
+        # Сборка без zoompan — показываем фото статично, но обязательно показываем
+        warn("в этой сборке ffmpeg нет фильтра zoompan — финальное фото будет без зума")
+        run_ffmpeg([
+            "-loop", "1", "-i", str(photo_path), "-t", f"{seconds:.3f}",
+            "-vf", normalize_filter(), "-frames:v", str(frames), *common, str(out),
+        ])
+
+    if not out.exists() or out.stat().st_size == 0:
+        raise RuntimeError("не удалось собрать финальное фото")
     return out
 
 
-def concat_segments(segments: list[Path], work_dir: Path) -> Path:
-    """Простая склейка встык (как в референсе — жёсткие склейки)."""
-    out = work_dir / "joined.mp4"
-    list_file = work_dir / "concat.txt"
+def warn(text: str) -> None:
+    print(f"      [!] {text}")
+
+
+def concat_segments(segments: list[Path], work_dir: Path, name: str = "joined.mp4") -> Path:
+    """Склейка встык, как в референсе — жёсткие склейки.
+
+    Сначала пробуем быстрый путь через concat-демуксер с -c copy. Если склейка
+    вышла короче суммы частей (так бывает, когда у сегментов разъезжаются
+    тайминги), пересобираем через фильтр concat с перекодированием — медленнее,
+    зато ни одна часть не теряется.
+    """
+    out = work_dir / name
+    expected = sum(media_duration(p) for p in segments)
+
+    list_file = work_dir / f"{name}.txt"
     list_file.write_text("".join(f"file '{p}'\n" for p in segments), encoding="utf-8")
-    run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(out)])
+    try:
+        run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(out)])
+        if abs(media_duration(out) - expected) <= 0.35:
+            return out
+        warn("быстрая склейка потеряла часть материала, пересобираю с перекодированием")
+    except RuntimeError as exc:
+        warn(f"быстрая склейка не удалась ({str(exc)[:80]}), пересобираю с перекодированием")
+
+    inputs: list[str] = []
+    for segment in segments:
+        inputs += ["-i", str(segment)]
+    streams = "".join(f"[{i}:v]" for i in range(len(segments)))
+    run_ffmpeg([
+        *inputs,
+        "-filter_complex", f"{streams}concat=n={len(segments)}:v=1:a=0,format=yuv420p[v]",
+        "-map", "[v]", "-an", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        str(out),
+    ])
     return out
 
 
@@ -434,20 +485,33 @@ def assemble(idea: Idea, rng: random.Random, use_crossfade: bool) -> Path:
     with tempfile.TemporaryDirectory(prefix="reel_") as tmp:
         work_dir = Path(tmp)
 
-        print(f"      [1/3] хук {hook_seconds:.1f}с + надпись")
         seg1 = build_hook(hook_video, idea.caption, hook_seconds, work_dir)
+        print(f"      [1/3] хук + надпись — {media_duration(seg1):.2f}с")
 
-        print("      [2/3] средняя часть")
         seg2 = build_middle(config.MIDDLE_VIDEO, config.MIDDLE_MAX_SECONDS, work_dir)
+        print(f"      [2/3] средняя часть — {media_duration(seg2):.2f}с")
 
-        print(f"      [3/3] финальное фото {final_seconds:.1f}с")
         seg3 = build_final(final_photo, final_seconds, work_dir)
+        print(f"      [3/3] итоговое фото {final_photo.name} — {media_duration(seg3):.2f}с")
 
-        if use_crossfade:
-            head = concat_segments([seg1, seg2], work_dir)
+        expected = media_duration(seg1) + media_duration(seg2) + media_duration(seg3)
+
+        if use_crossfade and has_filter("xfade"):
+            head = concat_segments([seg1, seg2], work_dir, "head.mp4")
             joined = join_with_crossfade(head, seg3, work_dir, config.CROSSFADE_SECONDS)
+            expected -= config.CROSSFADE_SECONDS
         else:
+            if use_crossfade:
+                warn("в этой сборке ffmpeg нет фильтра xfade — склеиваю встык, как в референсе")
             joined = concat_segments([seg1, seg2, seg3], work_dir)
+
+        # Контроль: если хвост потерялся, лучше узнать об этом сразу
+        got = media_duration(joined)
+        if got < expected - 0.5:
+            raise RuntimeError(
+                f"в ролике не хватает {expected - got:.2f}с — похоже, финальное фото не попало "
+                f"в склейку (ожидалось {expected:.2f}с, получилось {got:.2f}с)"
+            )
 
         music = pick_music(config.MUSIC_DIR, rng)
         if music:
@@ -464,7 +528,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Монтаж готовых роликов по структуре референса.")
     parser.add_argument("--limit", type=int, default=0, help="Максимум роликов за запуск (0 = все).")
     parser.add_argument("--idea", type=int, default=0, help="Смонтировать только идею с этим номером.")
-    parser.add_argument("--no-crossfade", action="store_true", help="Без перехода на финальное фото.")
+    parser.add_argument(
+        "--crossfade", action="store_true",
+        help="Плавный переход на финальное фото. По умолчанию склейка встык, как в референсе.",
+    )
+    parser.add_argument("--no-crossfade", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--seed", type=int, default=0, help="Фиксировать случайность (для повторяемости).")
     parser.add_argument("--ideas-file", default=str(config.IDEAS_FILE))
     args = parser.parse_args()
@@ -500,7 +568,7 @@ def main() -> None:
     for idea in queue:
         print(f"[{idea.number:03d}] {idea.title} — «{idea.caption}»")
         try:
-            out_path = assemble(idea, rng, use_crossfade=not args.no_crossfade)
+            out_path = assemble(idea, rng, use_crossfade=args.crossfade)
         except Exception as exc:  # noqa: BLE001
             print(f"      ОШИБКА: {exc}\n")
             continue
