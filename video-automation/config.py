@@ -84,13 +84,19 @@ OPENAI_IMAGE_MODEL = os.getenv("VITYA_IMAGE_MODEL", "gpt-image-1")
 # =============================================================================
 # ГЕНЕРАЦИЯ ФОТО
 # =============================================================================
-# "openai"  — gpt-image-1 с вашим фото как референсом (лучше держит лицо)
-# "fastgen" — api.fast-gen.ai, как в вашем рабочем скрипте
-IMAGE_BACKEND = os.getenv("VITYA_IMAGE_BACKEND", "openai").strip().lower()
+# "flow"   — api.fast-gen.ai, Nano Banana Pro. Лучший вариант: держит лицо по
+#            именованным фото-референсам и умеет 9:16 НАТИВНО, поэтому кадр
+#            не растягивается при последующем оживлении.
+# "openai" — gpt-image-1. Отдаёт только 1024x1536 (это 2:3), из-за чего при
+#            оживлении в 9:16 лицо вытягивается по вертикали.
+IMAGE_BACKEND = os.getenv("VITYA_IMAGE_BACKEND", "flow").strip().lower()
 
-# Вертикальный размер под рилс. gpt-image-1 поддерживает 1024x1536.
+# Вертикальный формат под рилс
+IMAGE_ASPECT_RATIO = os.getenv("VITYA_IMAGE_ASPECT", "9:16")
 OPENAI_IMAGE_SIZE = os.getenv("VITYA_IMAGE_SIZE", "1024x1536")
-IMAGE_ASPECT_RATIO = os.getenv("VITYA_IMAGE_ASPECT", "9:16")   # для fast-gen
+
+# Апскейл картинки 2x у Flow. Удваивает стоимость (4 -> 8 кредитов).
+IMAGE_UPSCALE_2X = os.getenv("VITYA_IMAGE_UPSCALE_2X", "0").strip().lower() in ("1", "true", "yes", "да")
 
 
 # =============================================================================
@@ -98,7 +104,10 @@ IMAGE_ASPECT_RATIO = os.getenv("VITYA_IMAGE_ASPECT", "9:16")   # для fast-gen
 # =============================================================================
 
 FAST_GEN_BASE_URL = os.getenv("FAST_GEN_API_BASE", "https://api.fast-gen.ai")
-OP_IMAGE_GENERATE = os.getenv("FAST_GEN_IMAGE_OPERATION", "flower_image_generate")
+# Nano Banana Pro — держит лицо по фото-референсам заметно лучше остальных.
+# Альтернативы: nano_banana_2_image_generate, nano_banana_2_lite_image_generate,
+# flower_image_generate (дешевле, но лицо держит хуже).
+OP_IMAGE_GENERATE = os.getenv("FAST_GEN_IMAGE_OPERATION", "nano_banana_pro_image_generate")
 OP_VIDEO_FROM_IMAGE = os.getenv("FAST_GEN_VIDEO_OPERATION", "flow_video_from_ingredients")
 VIDEO_MODEL = os.getenv("FAST_GEN_VIDEO_MODEL") or None
 VIDEO_ASPECT_RATIO = os.getenv("FAST_GEN_VIDEO_ASPECT_RATIO", "9:16")

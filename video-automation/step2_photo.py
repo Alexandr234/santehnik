@@ -20,7 +20,7 @@
     python3 step2_photo.py                 # обработать все новые идеи
     python3 step2_photo.py --limit 3       # только первые 3
     python3 step2_photo.py --idea 7        # только идею №7
-    python3 step2_photo.py --backend fastgen
+    python3 step2_photo.py --backend openai   # запасной вариант через gpt-image-1
 
 Ключи берутся из окружения, как в старых скриптах.
 """
@@ -36,6 +36,7 @@ from openai import OpenAI
 
 import config
 import fastgen_client
+import image_utils
 from ideas_store import (
     STATUS_NEW,
     STATUS_PHOTO,
@@ -166,9 +167,30 @@ def build_photo_prompt(client: OpenAI, appearance: str, idea: Idea, with_appeara
     return prompt or scene
 
 
-IDENTITY_INSTRUCTION = (
-    "На приложенных фотографиях — конкретный реальный мужчина. "
-    "В результате должен быть ИМЕННО ОН, а не похожий на него человек.\n\n"
+def identity_instruction(reference_names: list[str] | None = None) -> str:
+    """Инструкция сохранения личности.
+
+    Если референсы переданы именованными, промпт ссылается на них по именам
+    файлов — так модель понимает, что на всех снимках ОДИН И ТОТ ЖЕ человек,
+    и держит лицо заметно точнее, чем от общей фразы «на фото».
+    """
+    if reference_names:
+        names = ", ".join(reference_names)
+        head = (
+            f"На изображениях {names} — ОДИН И ТОТ ЖЕ конкретный реальный мужчина, "
+            f"снятый с разных ракурсов. Сгенерируй в новой сцене ИМЕННО ЕГО, "
+            f"а не похожего на него человека. Его лицо с {names} перенеси "
+            f"без изменений, черта в черту.\n\n"
+        )
+    else:
+        head = (
+            "На приложенных фотографиях — конкретный реальный мужчина. "
+            "В результате должен быть ИМЕННО ОН, а не похожий на него человек.\n\n"
+        )
+    return head + IDENTITY_RULES
+
+
+IDENTITY_RULES = (
     "СТРОГО СОХРАНИ БЕЗ ИЗМЕНЕНИЙ: форму и пропорции лица, форму и посадку глаз, "
     "форму бровей, форму носа, форму губ, линию челюсти и подбородка, форму ушей, "
     "линию роста волос, длину и форму бороды и усов, оттенок кожи, родинки и "
@@ -227,7 +249,7 @@ def generate_with_openai(client: OpenAI, prompt: str, face_photos: list[Path], o
                 response = client.images.edit(
                     model=config.OPENAI_IMAGE_MODEL,
                     image=handles,
-                    prompt=IDENTITY_INSTRUCTION + prompt,
+                    prompt=identity_instruction() + prompt,
                     size=config.OPENAI_IMAGE_SIZE,
                     **extra,
                 )
@@ -257,6 +279,25 @@ def generate_with_openai(client: OpenAI, prompt: str, face_photos: list[Path], o
     out_path.write_bytes(raw)
 
 
+def generate_with_flow(prompt: str, face_photos: list[Path], out_path: Path) -> None:
+    """Nano Banana Pro через api.fast-gen.ai.
+
+    Референсы уходят ИМЕНОВАННЫМИ, и промпт ссылается на них по именам файлов —
+    так модель понимает, что это один и тот же человек. Формат сразу 9:16,
+    поэтому кадр не придётся растягивать при оживлении.
+    """
+    names = [
+        fastgen_client.reference_filename(i, p)
+        for i, p in enumerate(face_photos, 1)
+    ]
+    fastgen_client.generate_image(
+        identity_instruction(names) + prompt,
+        out_path,
+        reference_images=face_photos,
+        aspect_ratio=config.IMAGE_ASPECT_RATIO,
+    )
+
+
 def process_idea(
     client: OpenAI,
     idea: Idea,
@@ -269,7 +310,7 @@ def process_idea(
     print(f"      надпись: «{idea.caption}»")
 
     # При работе с картинкой-референсом словесное описание лица только мешает
-    prompt = build_photo_prompt(client, appearance, idea, with_appearance=(backend != "openai"))
+    prompt = build_photo_prompt(client, appearance, idea, with_appearance=False)
     print(f"      промпт: {prompt[:110]}...")
 
     out_path = config.PHOTOS_DIR / f"{idea.number:03d}_{_safe_name(idea.title)}.png"
@@ -278,7 +319,7 @@ def process_idea(
         if backend == "openai":
             generate_with_openai(client, prompt, face_photos, out_path)
         else:
-            fastgen_client.generate_image(prompt, out_path, reference_image=face_photos[0])
+            generate_with_flow(prompt, face_photos, out_path)
     except fastgen_client.PermanentError as exc:
         print(f"      ЗАБЛОКИРОВАНО: {exc}")
         return False, str(exc)
@@ -286,8 +327,14 @@ def process_idea(
         print(f"      ОШИБКА: {exc}")
         return False, str(exc)
 
+    # Приводим к 9:16: иначе провайдер растянет кадр при оживлении и лицо поплывёт
+    if image_utils.ensure_vertical(out_path):
+        print("      кадр обрезан до 9:16, чтобы лицо не растянулось при оживлении")
+
     size_mb = out_path.stat().st_size / 1024 / 1024
-    print(f"      сохранено: {out_path.name} ({size_mb:.2f} MB)")
+    aspect = image_utils.aspect_of(out_path)
+    ratio = f", {aspect:.3f} (нужно 0.563)" if aspect else ""
+    print(f"      сохранено: {out_path.name} ({size_mb:.2f} MB{ratio})")
     return True, str(out_path)
 
 
@@ -300,13 +347,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Генерация фото по идеям и вашему лицу.")
     parser.add_argument("--limit", type=int, default=0, help="Максимум идей за запуск (0 = все новые).")
     parser.add_argument("--idea", type=int, default=0, help="Обработать только идею с этим номером.")
-    parser.add_argument("--backend", choices=["openai", "fastgen"], default=config.IMAGE_BACKEND)
+    parser.add_argument("--backend", choices=["flow", "openai"], default=config.IMAGE_BACKEND)
     parser.add_argument("--refresh-face", action="store_true", help="Заново проанализировать фото лица.")
     parser.add_argument("--ideas-file", default=str(config.IDEAS_FILE))
     args = parser.parse_args()
 
     config.require_openai_key()
-    if args.backend == "fastgen":
+    if args.backend != "openai":
         config.require_fastgen_key()
     config.ensure_dirs()
 

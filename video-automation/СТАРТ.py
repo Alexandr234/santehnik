@@ -362,7 +362,7 @@ def main() -> None:
     parser.add_argument("--count", type=int, default=0, help="Сколько роликов сделать.")
     parser.add_argument("--yes", action="store_true", help="Ничего не спрашивать.")
     parser.add_argument("--only-check", action="store_true", help="Только проверка окружения.")
-    parser.add_argument("--backend", choices=["openai", "fastgen"], default=None)
+    parser.add_argument("--backend", choices=["flow", "openai"], default=None)
     args = parser.parse_args()
 
     ASK = not args.yes

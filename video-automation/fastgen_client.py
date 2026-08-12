@@ -215,28 +215,61 @@ def save_result(result_item: dict, path: Path) -> None:
 # ВЫСОКОУРОВНЕВЫЕ ОПЕРАЦИИ
 # =============================================================================
 
-def generate_image(prompt: str, out_path: Path, reference_image: Path | None = None) -> str:
-    """Генерирует изображение. Если задан reference_image — передаёт его в inputs[].
+def reference_filename(index: int, path: Path) -> str:
+    """Имя, под которым референс виден модели и на которое ссылается промпт."""
+    suffix = path.suffix.lower() or ".jpg"
+    return f"face_{index}{suffix}"
 
-    Если провайдер не принимает inputs у этой операции, автоматически повторяет
-    запрос без референса, чтобы генерация не падала целиком.
+
+def generate_image(
+    prompt: str,
+    out_path: Path,
+    reference_images: list[Path] | Path | None = None,
+    aspect_ratio: str | None = None,
+) -> str:
+    """Генерирует изображение с фото-референсами лица.
+
+    Референсы передаются ИМЕНОВАННЫМИ (V6NamedMediaInput): у каждого есть
+    filename, и промпт ссылается на них по этому имени — так модель понимает,
+    что все они изображают одного и того же человека, и держит лицо.
+
+    Если провайдер не принимает такие inputs, автоматически откатывается
+    на обычный список data URI, а затем и вовсе на генерацию без референсов.
     """
-    payload: dict[str, Any] = {
+    if isinstance(reference_images, Path):
+        reference_images = [reference_images]
+    references = [p for p in (reference_images or []) if p.exists()]
+
+    base: dict[str, Any] = {
         "operation": config.OP_IMAGE_GENERATE,
         "prompt": prompt,
-        "aspect_ratio": config.IMAGE_ASPECT_RATIO,
+        "aspect_ratio": aspect_ratio or config.IMAGE_ASPECT_RATIO,
     }
-    if reference_image is not None and reference_image.exists():
-        payload["inputs"] = [image_to_data_uri(reference_image)]
+    if config.IMAGE_UPSCALE_2X:
+        base["generation_config"] = {"upscale": {"type": "2x"}}
 
-    try:
-        generation_id = create_generation(payload, label="IMAGE")
-    except PermanentError as exc:
-        if "inputs" not in payload:
-            raise
-        log(f"[INFO] Операция не приняла референс ({exc}). Повторяю без референса.")
-        payload.pop("inputs")
-        generation_id = create_generation(payload, label="IMAGE")
+    variants: list[dict[str, Any]] = []
+    if references:
+        named = [
+            {"filename": reference_filename(i, p), "input": image_to_data_uri(p)}
+            for i, p in enumerate(references, 1)
+        ]
+        variants.append({**base, "inputs": named})
+        variants.append({**base, "inputs": [image_to_data_uri(p) for p in references]})
+    variants.append(base)
+
+    generation_id: str | None = None
+    for index, payload in enumerate(variants):
+        try:
+            generation_id = create_generation(payload, label="IMAGE")
+            break
+        except PermanentError as exc:
+            if index == len(variants) - 1:
+                raise
+            log(f"[INFO] Формат запроса не принят ({str(exc)[:120]}). Пробую следующий.")
+
+    if generation_id is None:
+        raise PermanentError("не удалось создать генерацию изображения")
 
     result = poll_generation(generation_id, label="IMAGE")
     save_result(result, out_path)

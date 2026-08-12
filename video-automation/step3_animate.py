@@ -32,6 +32,7 @@ from threading import Lock
 
 import config
 import fastgen_client
+import image_utils
 from ideas_store import (
     STATUS_PHOTO,
     STATUS_VIDEO,
@@ -71,6 +72,11 @@ def animate_one(idea: Idea) -> tuple[Idea, bool, str]:
     photo_path = Path(idea.photo_file).expanduser()
     if not photo_path.exists():
         return idea, False, f"нет файла фото: {photo_path}"
+
+    # Страховка для фото, сделанных раньше: если пропорции не 9:16, провайдер
+    # натянет кадр на 9:16 и лицо вытянется. Обрезаем заранее.
+    if image_utils.ensure_vertical(photo_path):
+        print(f"[{idea.number:03d}] фото обрезано до 9:16, чтобы лицо не растянулось")
 
     out_path = config.VIDEOS_DIR / f"{idea.number:03d}_{_safe_name(idea.title)}.mp4"
     if out_path.exists() and out_path.stat().st_size > 0:
